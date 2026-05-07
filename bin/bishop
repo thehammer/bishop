@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# bishop — Claude Code budget-posture producer
+# Reads ~/.mother/rate-limits.json, writes ~/.claude/budget-posture.json
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration (all overridable for testing)
+# ---------------------------------------------------------------------------
+: "${BISHOP_SOURCE_PATH:=$HOME/.mother/rate-limits.json}"
+: "${BISHOP_OUTPUT_PATH:=$HOME/.claude/budget-posture.json}"
+: "${BISHOP_SOURCE_STALE_SECONDS:=600}"
+
+LOCK_PATH="${BISHOP_OUTPUT_PATH}.lock"
+ERR_LOG="${HOME}/.claude/budget-posture.errors.log"
+STATE_PATH="${BISHOP_OUTPUT_PATH}.state"
+ERR_LOG_MAX=102400  # 100 KB
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_bishop_log_err() {
+  local msg="[$(date -u +%FT%TZ)] bishop: $*"
+  # Rotate log at 100 KB
+  if [[ -f "$ERR_LOG" ]]; then
+    local size
+    size=$(stat -f %z "$ERR_LOG" 2>/dev/null || echo 0)
+    if [[ "$size" -gt "$ERR_LOG_MAX" ]]; then
+      mv "$ERR_LOG" "${ERR_LOG}.1"
+      : > "$ERR_LOG"
+    fi
+  fi
+  echo "$msg" >> "$ERR_LOG" 2>/dev/null || true
+}
+
+_bishop_now() {
+  if [[ -n "${BISHOP_NOW_OVERRIDE:-}" ]]; then
+    echo "$BISHOP_NOW_OVERRIDE"
+  else
+    date +%s
+  fi
+}
+
+_bishop_source_mtime() {
+  if [[ -n "${BISHOP_MTIME_OVERRIDE:-}" ]]; then
+    echo "$BISHOP_MTIME_OVERRIDE"
+  else
+    stat -f %m "$BISHOP_SOURCE_PATH" 2>/dev/null || echo 0
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# jq program for posture computation
+# ---------------------------------------------------------------------------
+
+_BISHOP_JQ_PROGRAM='
+def window_seconds(key): if key == "five_hour" then 18000 else 604800 end;
+
+def compute_window(key; now):
+  .[key] as $w
+  | window_seconds(key) as $ws
+  | ($w.used_percentage // 0) as $used
+  | ($w.resets_at // 0) as $resets
+  | (($ws - ($resets - now)) / $ws * 100) as $raw_elapsed
+  | (if $raw_elapsed < 0 then 0 elif $raw_elapsed > 100 then 100 else $raw_elapsed end) as $elapsed
+  | (if $elapsed < 2 then null
+     else ($used / (if $elapsed < 1 then 1 else $elapsed end))
+     end) as $pace
+  | {
+      used_pct: $used,
+      elapsed_pct: ($elapsed | . * 10 | round / 10),
+      pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
+      resets_at: $resets,
+      level: (
+        if $pace == null then "normal"
+        elif key == "five_hour" then
+          (if $pace > 1.2 then "conservative"
+           elif $pace >= 0.85 then "normal"
+           elif $pace >= 0.6 then "elevated"
+           else "flush" end)
+        else
+          (if $pace > 1.1 then "conservative"
+           elif $pace >= 0.9 then "normal"
+           elif $pace >= 0.7 then "elevated"
+           else "flush" end)
+        end
+      )
+    };
+
+. as $src
+| compute_window("five_hour"; $now) as $fh
+| compute_window("seven_day"; $now) as $sd
+| (["conservative","normal","elevated","flush"]) as $rank
+| (
+    [$fh.level, $sd.level]
+    | map(. as $level | {l: $level, r: ($rank | index($level))})
+    | min_by(.r) | .l
+  ) as $posture
+| {
+    ts: ($now | todateiso8601),
+    posture: $posture,
+    five_hour: $fh,
+    seven_day: $sd,
+    source_mtime: ($source_mtime | todateiso8601),
+    source_age_seconds: ($now - $source_mtime),
+    stale_input: ($now - $source_mtime > $stale_seconds)
+  }
+| if .stale_input then .posture = "normal" else . end
+'
+
+# ---------------------------------------------------------------------------
+# Subcommand: --refresh
+# ---------------------------------------------------------------------------
+
+_bishop_refresh() {
+  # Short-circuit if disabled
+  if [[ -n "${BISHOP_DISABLED:-}" ]]; then
+    exit 0
+  fi
+
+  # Acquire exclusive lock if flock is available; otherwise proceed unlocked
+  local use_flock=0
+  command -v flock >/dev/null 2>&1 && use_flock=1
+
+  if [[ "$use_flock" -eq 1 ]]; then
+    exec 9>"$LOCK_PATH"
+    if ! flock -n 9; then
+      # Another instance is refreshing; skip
+      exit 0
+    fi
+  fi
+
+  # Check source exists
+  if [[ ! -f "$BISHOP_SOURCE_PATH" ]]; then
+    _bishop_log_err "source not found: $BISHOP_SOURCE_PATH"
+    exit 0
+  fi
+
+  # Read source mtime and compare to saved state (idempotent skip)
+  local mtime
+  mtime="$(_bishop_source_mtime)"
+
+  if [[ -f "$STATE_PATH" ]]; then
+    local saved_mtime
+    saved_mtime="$(cat "$STATE_PATH" 2>/dev/null || echo 0)"
+    if [[ "$mtime" == "$saved_mtime" ]]; then
+      exit 0
+    fi
+  fi
+
+  # Compute posture via single jq invocation
+  local now
+  now="$(_bishop_now)"
+
+  local tmp_output
+  tmp_output="${BISHOP_OUTPUT_PATH}.tmp.$$"
+
+  if ! jq \
+    --argjson now "$now" \
+    --argjson source_mtime "$mtime" \
+    --argjson stale_seconds "$BISHOP_SOURCE_STALE_SECONDS" \
+    "$_BISHOP_JQ_PROGRAM" \
+    "$BISHOP_SOURCE_PATH" > "$tmp_output" 2>/dev/null; then
+    _bishop_log_err "jq failed on $BISHOP_SOURCE_PATH"
+    rm -f "$tmp_output"
+    exit 0
+  fi
+
+  # Atomic rename
+  mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
+
+  # Save mtime state (tmp+mv for atomicity)
+  local tmp_state
+  tmp_state="${STATE_PATH}.tmp.$$"
+  echo "$mtime" > "$tmp_state"
+  mv "$tmp_state" "$STATE_PATH"
+
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: status [--json]
+# ---------------------------------------------------------------------------
+
+_bishop_status() {
+  local json_mode=0
+  if [[ "${1:-}" == "--json" ]]; then
+    json_mode=1
+  fi
+
+  if [[ "$json_mode" -eq 1 ]]; then
+    if [[ ! -f "$BISHOP_OUTPUT_PATH" ]]; then
+      echo "{}"
+      exit 0
+    fi
+    cat "$BISHOP_OUTPUT_PATH"
+    exit 0
+  fi
+
+  # Human-readable
+  if [[ ! -f "$BISHOP_OUTPUT_PATH" ]]; then
+    echo "unknown (no posture file)"
+    exit 0
+  fi
+
+  local posture fh_level sd_level age
+  posture="$(jq -r '.posture // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
+  fh_level="$(jq -r '.five_hour.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
+  sd_level="$(jq -r '.seven_day.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
+  age="$(jq -r '.source_age_seconds // 0 | floor' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "0")"
+
+  echo "${posture} (5h: ${fh_level} · 7d: ${sd_level} · age ${age}s)"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: get <field>
+# ---------------------------------------------------------------------------
+
+_bishop_get() {
+  local field="${1:-}"
+  if [[ -z "$field" ]]; then
+    echo "Usage: bishop get <field>" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$BISHOP_OUTPUT_PATH" ]]; then
+    exit 0
+  fi
+
+  jq -r ".${field} // empty" "$BISHOP_OUTPUT_PATH" 2>/dev/null || true
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: install-agent
+# ---------------------------------------------------------------------------
+
+_bishop_install_agent() {
+  local plist_template plist_dest bin_path real_bin
+  # Resolve symlinks to find the real script location
+  real_bin="${BASH_SOURCE[0]}"
+  if command -v readlink >/dev/null 2>&1; then
+    real_bin="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  fi
+  plist_template="$(cd "$(dirname "$real_bin")/.." && pwd)/launchd/com.user.bishop.refresh.plist"
+  plist_dest="${HOME}/Library/LaunchAgents/com.user.bishop.refresh.plist"
+  bin_path="$(cd "$(dirname "$real_bin")" && pwd)/bishop"
+
+  if [[ ! -f "$plist_template" ]]; then
+    echo "Error: plist template not found at $plist_template" >&2
+    exit 1
+  fi
+
+  mkdir -p "${HOME}/Library/LaunchAgents"
+
+  sed -e "s|__BISHOP_BIN__|${bin_path}|g" \
+      -e "s|__HOME__|${HOME}|g" \
+      "$plist_template" > "$plist_dest"
+
+  # Unload if loaded, then load fresh (idempotent)
+  launchctl bootout "gui/$(id -u)/com.user.bishop.refresh" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist_dest"
+
+  echo "Installed and loaded com.user.bishop.refresh (runs every 60s)"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: uninstall-agent
+# ---------------------------------------------------------------------------
+
+_bishop_uninstall_agent() {
+  local plist_dest
+  plist_dest="${HOME}/Library/LaunchAgents/com.user.bishop.refresh.plist"
+
+  launchctl bootout "gui/$(id -u)/com.user.bishop.refresh" 2>/dev/null || true
+  rm -f "$plist_dest"
+
+  echo "Uninstalled com.user.bishop.refresh"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: --help
+# ---------------------------------------------------------------------------
+
+_bishop_help() {
+  cat <<'EOF'
+bishop — Claude Code budget-posture producer
+
+USAGE
+  bishop --refresh              Compute posture from rate-limits source and
+                                write ~/.claude/budget-posture.json (atomic,
+                                idempotent, safe to run concurrently).
+
+  bishop status                 Print human-readable posture summary.
+  bishop status --json          Print raw budget-posture.json to stdout.
+
+  bishop get <field>            Print a single field (dot-path supported).
+                                E.g.: bishop get posture
+                                      bishop get five_hour.level
+
+  bishop install-agent          Install and start the launchd agent that runs
+                                bishop --refresh every 60 seconds.
+  bishop uninstall-agent        Stop and remove the launchd agent.
+
+  bishop --help                 Show this help.
+
+POSTURE LEVELS
+  conservative  Pace > expected. Slow down — use cheaper models.
+  normal        On track. Normal model selection.
+  elevated      Pace < expected. Budget headroom available.
+  flush         Well under pace. Free to use expensive models.
+
+ENVIRONMENT VARIABLES
+  BISHOP_SOURCE_PATH            Rate-limits input (default: ~/.mother/rate-limits.json)
+  BISHOP_OUTPUT_PATH            Posture output   (default: ~/.claude/budget-posture.json)
+  BISHOP_SOURCE_STALE_SECONDS   Input age before marking stale_input=true (default: 600)
+  BISHOP_DISABLED               Set to any value to skip --refresh entirely.
+  BISHOP_NOW_OVERRIDE           Override current epoch (testing).
+  BISHOP_MTIME_OVERRIDE         Override source file mtime (testing).
+EOF
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+CMD="${1:-}"
+
+case "$CMD" in
+  --refresh)
+    _bishop_refresh
+    ;;
+  status)
+    _bishop_status "${2:-}"
+    ;;
+  get)
+    _bishop_get "${2:-}"
+    ;;
+  install-agent)
+    _bishop_install_agent
+    ;;
+  uninstall-agent)
+    _bishop_uninstall_agent
+    ;;
+  --help|-h|help)
+    _bishop_help
+    ;;
+  "")
+    _bishop_help
+    ;;
+  *)
+    echo "bishop: unknown subcommand: $CMD" >&2
+    echo "Run 'bishop --help' for usage." >&2
+    exit 1
+    ;;
+esac
