@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # bishop — Claude Code budget-posture producer
-# Reads ~/.mother/rate-limits.json, writes ~/.claude/budget-posture.json
+# Primary: reads Anthropic OAuth /api/oauth/usage endpoint via bishop-fetch-usage.
+# Fallback: reads ~/.mother/rate-limits.json (Mother aggregate).
+# Writes ~/.claude/budget-posture.json (atomic, idempotent, safe to run concurrently).
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -9,6 +11,9 @@ set -euo pipefail
 : "${BISHOP_SOURCE_PATH:=$HOME/.mother/rate-limits.json}"
 : "${BISHOP_OUTPUT_PATH:=$HOME/.claude/budget-posture.json}"
 : "${BISHOP_SOURCE_STALE_SECONDS:=600}"
+: "${BISHOP_USAGE_FETCH_CMD:=$(dirname "$0")/bishop-fetch-usage}"
+: "${BISHOP_USAGE_CACHE_PATH:=$HOME/.claude/oauth-usage.json}"
+: "${BISHOP_USAGE_CACHE_TTL_SECONDS:=55}"
 
 LOCK_PATH="${BISHOP_OUTPUT_PATH}.lock"
 ERR_LOG="${HOME}/.claude/budget-posture.errors.log"
@@ -49,8 +54,128 @@ _bishop_source_mtime() {
   fi
 }
 
+_bishop_file_mtime() {
+  local file="$1"
+  stat -f %m "$file" 2>/dev/null || echo 0
+}
+
 # ---------------------------------------------------------------------------
-# jq program for posture computation
+# jq program: translate OAuth response → posture output
+#
+# The window math is inlined because jq does not support sourcing external
+# programs and we need it in one self-contained expression for performance.
+# ---------------------------------------------------------------------------
+
+_BISHOP_OAUTH_JQ_PROGRAM='
+# Strip fractional seconds and normalize +00:00 → Z before ISO parse
+# (macOS jq fromdateiso8601 only accepts Z-suffix UTC, not +00:00)
+def parse_iso:
+  sub("\\.[0-9]+(?=[+Z])"; "")
+  | sub("\\+00:00$"; "Z")
+  | fromdateiso8601;
+
+def window_seconds(key): if key == "five_hour" then 18000 else 604800 end;
+
+def compute_window(key; src; now):
+  src[key] as $w
+  | window_seconds(key) as $ws
+  | ($w.used_percentage // 0) as $used
+  | ($w.resets_at // 0) as $resets
+  | (($ws - ($resets - now)) / $ws * 100) as $raw_elapsed
+  | (if $raw_elapsed < 0 then 0 elif $raw_elapsed > 100 then 100 else $raw_elapsed end) as $elapsed
+  | (if $elapsed < 2 then null
+     else ($used / (if $elapsed < 1 then 1 else $elapsed end))
+     end) as $pace
+  | {
+      used_pct: $used,
+      elapsed_pct: ($elapsed | . * 10 | round / 10),
+      pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
+      resets_at: $resets,
+      level: (
+        if $pace == null then "normal"
+        elif key == "five_hour" then
+          (if $pace > 1.2 then "conservative"
+           elif $pace >= 0.85 then "normal"
+           elif $pace >= 0.6 then "elevated"
+           else "flush" end)
+        else
+          (if $pace > 1.1 then "conservative"
+           elif $pace >= 0.9 then "normal"
+           elif $pace >= 0.7 then "elevated"
+           else "flush" end)
+        end
+      )
+    };
+
+def posture_for(fh_level; sd_level):
+  (["conservative","normal","elevated","flush"]) as $rank
+  | ([fh_level, sd_level]
+     | map(. as $l | {l: $l, r: ($rank | index($l))})
+     | min_by(.r) | .l);
+
+def model_entry(key):
+  .[key] as $bucket
+  | if $bucket == null then null
+    else
+      ($bucket.resets_at | parse_iso) as $resets
+      | if $resets <= $now then null
+        else
+          {
+            status: (if ($bucket.utilization // 0) >= 100 then "exhausted" else "active" end),
+            used_pct: ($bucket.utilization // 0),
+            resets_at: $resets
+          }
+        end
+    end;
+
+. as $oauth
+# Normalize to posture-math shape
+| {
+    five_hour: {
+      used_percentage: ($oauth.five_hour.utilization // 0),
+      resets_at: ($oauth.five_hour.resets_at | parse_iso)
+    },
+    seven_day: {
+      used_percentage: ($oauth.seven_day.utilization // 0),
+      resets_at: ($oauth.seven_day.resets_at | parse_iso)
+    }
+  } as $normalized
+| compute_window("five_hour"; $normalized; $now) as $fh
+| compute_window("seven_day"; $normalized; $now) as $sd
+| posture_for($fh.level; $sd.level) as $posture
+
+| model_entry("seven_day_sonnet") as $sonnet
+| model_entry("seven_day_opus")   as $opus
+| model_entry("seven_day_haiku")  as $haiku
+| [
+    (if $sonnet != null and $sonnet.status == "exhausted" then "sonnet" else empty end),
+    (if $opus   != null and $opus.status   == "exhausted" then "opus"   else empty end),
+    (if $haiku  != null and $haiku.status  == "exhausted" then "haiku"  else empty end)
+  ] as $exhausted_models
+| ($oauth.extra_usage // {}) as $eu
+| {
+    ts: ($now | todateiso8601),
+    source: "oauth_usage",
+    posture: (if $stale_input then "normal" else $posture end),
+    five_hour: $fh,
+    seven_day: $sd,
+    models: { sonnet: $sonnet, opus: $opus, haiku: $haiku },
+    exhausted_models: $exhausted_models,
+    extra_usage: {
+      is_enabled:    ($eu.is_enabled    // false),
+      used_credits:  ($eu.used_credits  // null),
+      currency:      ($eu.currency      // "USD"),
+      monthly_limit: ($eu.monthly_limit // null),
+      utilization:   ($eu.utilization   // null)
+    },
+    source_mtime: ($source_mtime | todateiso8601),
+    source_age_seconds: ($now - $source_mtime),
+    stale_input: $stale_input
+  }
+'
+
+# ---------------------------------------------------------------------------
+# jq program: translate Mother aggregate → posture output (legacy path)
 # ---------------------------------------------------------------------------
 
 _BISHOP_JQ_PROGRAM='
@@ -98,9 +223,13 @@ def compute_window(key; now):
   ) as $posture
 | {
     ts: ($now | todateiso8601),
+    source: "mother_aggregate",
     posture: $posture,
     five_hour: $fh,
     seven_day: $sd,
+    models: { sonnet: null, opus: null, haiku: null },
+    exhausted_models: [],
+    extra_usage: null,
     source_mtime: ($source_mtime | todateiso8601),
     source_age_seconds: ($now - $source_mtime),
     stale_input: ($now - $source_mtime > $stale_seconds)
@@ -130,13 +259,98 @@ _bishop_refresh() {
     fi
   fi
 
-  # Check source exists
+  local now
+  now="$(_bishop_now)"
+
+  local tmp_output
+  tmp_output="${BISHOP_OUTPUT_PATH}.tmp.$$"
+
+  # -------------------------------------------------------------------------
+  # OAuth path: try bishop-fetch-usage with TTL-based cache
+  # -------------------------------------------------------------------------
+  local oauth_source=""   # "fresh" | "cached" | ""
+  local oauth_data=""
+
+  # Check if we have a fresh cached OAuth response
+  if [[ -f "$BISHOP_USAGE_CACHE_PATH" ]]; then
+    local cache_mtime cache_age
+    cache_mtime="$(_bishop_file_mtime "$BISHOP_USAGE_CACHE_PATH")"
+    cache_age=$(( now - cache_mtime ))
+    if [[ "$cache_age" -lt "$BISHOP_USAGE_CACHE_TTL_SECONDS" ]]; then
+      oauth_data="$(cat "$BISHOP_USAGE_CACHE_PATH" 2>/dev/null || true)"
+      if [[ -n "$oauth_data" ]]; then
+        oauth_source="cached"
+      fi
+    fi
+  fi
+
+  # If no fresh cache, attempt a live fetch
+  if [[ -z "$oauth_source" ]]; then
+    if [[ -x "${BISHOP_USAGE_FETCH_CMD:-}" ]]; then
+      local fetch_out fetch_exit
+      fetch_out="$("$BISHOP_USAGE_FETCH_CMD" 2>/dev/null)" && fetch_exit=0 || fetch_exit=$?
+
+      if [[ "$fetch_exit" -eq 0 ]] && [[ -n "$fetch_out" ]]; then
+        local tmp_cache
+        tmp_cache="${BISHOP_USAGE_CACHE_PATH}.tmp.$$"
+        printf '%s\n' "$fetch_out" > "$tmp_cache"
+        mv "$tmp_cache" "$BISHOP_USAGE_CACHE_PATH"
+        oauth_data="$fetch_out"
+        oauth_source="fresh"
+      else
+        # Any non-zero exit: log and keep stale cache if available
+        if [[ "$fetch_exit" -eq 3 ]]; then
+          _bishop_log_err "OAuth fetch rate-limited (429); keeping stale cache"
+        elif [[ "$fetch_exit" -eq 2 ]]; then
+          _bishop_log_err "OAuth token not found in keychain; keeping stale cache"
+        else
+          _bishop_log_err "OAuth fetch failed (exit $fetch_exit); keeping stale cache"
+        fi
+        if [[ -f "$BISHOP_USAGE_CACHE_PATH" ]]; then
+          oauth_data="$(cat "$BISHOP_USAGE_CACHE_PATH" 2>/dev/null || true)"
+          [[ -n "$oauth_data" ]] && oauth_source="cached"
+        fi
+      fi
+    else
+      _bishop_log_err "bishop-fetch-usage not found or not executable: ${BISHOP_USAGE_FETCH_CMD:-unset}"
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # If we have OAuth data, produce output from it
+  # -------------------------------------------------------------------------
+  if [[ -n "$oauth_source" ]] && [[ -n "$oauth_data" ]]; then
+    local cache_mtime cache_age stale_input
+    cache_mtime="$(_bishop_file_mtime "$BISHOP_USAGE_CACHE_PATH")"
+    cache_age=$(( now - cache_mtime ))
+    if [[ "$cache_age" -gt "$BISHOP_SOURCE_STALE_SECONDS" ]]; then
+      stale_input="true"
+      _bishop_log_err "OAuth cache is stale (${cache_age}s old); posture forced to normal"
+    else
+      stale_input="false"
+    fi
+
+    if printf '%s' "$oauth_data" | jq \
+        --argjson now "$now" \
+        --argjson source_mtime "$cache_mtime" \
+        --argjson stale_input "$stale_input" \
+        "$_BISHOP_OAUTH_JQ_PROGRAM" > "$tmp_output" 2>/dev/null; then
+      mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
+      exit 0
+    else
+      _bishop_log_err "jq failed parsing OAuth data; falling back to Mother aggregate"
+      rm -f "$tmp_output"
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # Fallback: Mother aggregate (legacy path — exactly as before)
+  # -------------------------------------------------------------------------
   if [[ ! -f "$BISHOP_SOURCE_PATH" ]]; then
     _bishop_log_err "source not found: $BISHOP_SOURCE_PATH"
     exit 0
   fi
 
-  # Read source mtime and compare to saved state (idempotent skip)
   local mtime
   mtime="$(_bishop_source_mtime)"
 
@@ -147,13 +361,6 @@ _bishop_refresh() {
       exit 0
     fi
   fi
-
-  # Compute posture via single jq invocation
-  local now
-  now="$(_bishop_now)"
-
-  local tmp_output
-  tmp_output="${BISHOP_OUTPUT_PATH}.tmp.$$"
 
   if ! jq \
     --argjson now "$now" \
@@ -166,10 +373,8 @@ _bishop_refresh() {
     exit 0
   fi
 
-  # Atomic rename
   mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
 
-  # Save mtime state (tmp+mv for atomicity)
   local tmp_state
   tmp_state="${STATE_PATH}.tmp.$$"
   echo "$mtime" > "$tmp_state"
@@ -203,13 +408,78 @@ _bishop_status() {
     exit 0
   fi
 
-  local posture fh_level sd_level age
+  local posture fh_level sd_level age source
   posture="$(jq -r '.posture // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
   fh_level="$(jq -r '.five_hour.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
   sd_level="$(jq -r '.seven_day.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
   age="$(jq -r '.source_age_seconds // 0 | floor' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "0")"
+  source="$(jq -r '.source // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
 
   echo "${posture} (5h: ${fh_level} · 7d: ${sd_level} · age ${age}s)"
+
+  if [[ "$source" == "oauth_usage" ]]; then
+    local overage_enabled
+    overage_enabled="$(jq -r '.extra_usage.is_enabled // false' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "false")"
+
+    _format_model() {
+      local name="$1"
+      local entry
+      entry="$(jq -c --arg n "$name" '.models[$n]' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "null")"
+      if [[ "$entry" == "null" ]]; then
+        printf '%s none' "$name"
+        return
+      fi
+      local status used_pct resets_at now secs_left remain_str suffix
+      status="$(printf '%s' "$entry"   | jq -r '.status'   2>/dev/null || echo "active")"
+      used_pct="$(printf '%s' "$entry" | jq -r '.used_pct' 2>/dev/null || echo "0")"
+      resets_at="$(printf '%s' "$entry"| jq -r '.resets_at' 2>/dev/null || echo "0")"
+      now="$(_bishop_now)"
+      secs_left=$(( resets_at - now ))
+      if [[ "$secs_left" -le 0 ]]; then
+        remain_str="now"
+      else
+        local d h
+        d=$(( secs_left / 86400 ))
+        h=$(( (secs_left % 86400) / 3600 ))
+        if [[ "$d" -gt 0 ]]; then remain_str="${d}d${h}h"; else remain_str="${h}h"; fi
+      fi
+      suffix=""
+      if [[ "$status" == "exhausted" ]] && [[ "$overage_enabled" == "true" ]]; then
+        suffix="*"
+      fi
+      if [[ "$status" == "exhausted" ]]; then
+        printf '%s %s%% EXHAUSTED (resets %s)%s' "$name" "$used_pct" "$remain_str" "$suffix"
+      else
+        printf '%s %s%%' "$name" "$used_pct"
+      fi
+    }
+
+    local sonnet_str opus_str haiku_str
+    sonnet_str="$(_format_model sonnet)"
+    opus_str="$(_format_model opus)"
+    haiku_str="$(_format_model haiku)"
+    printf 'models:  %s  %s  %s\n' "$sonnet_str" "$opus_str" "$haiku_str"
+
+    if [[ "$overage_enabled" == "true" ]]; then
+      local used_credits currency monthly_limit dollars
+      used_credits="$(jq -r '.extra_usage.used_credits // 0' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "0")"
+      currency="$(jq -r '.extra_usage.currency // "USD"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "USD")"
+      monthly_limit="$(jq -r '.extra_usage.monthly_limit // "null"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "null")"
+      if [[ "$currency" == "USD" ]]; then
+        dollars="$(printf '%.2f' "$(echo "scale=2; $used_credits / 100" | bc 2>/dev/null || echo "$used_credits")")"
+        if [[ "$monthly_limit" != "null" ]]; then
+          printf 'overage: $%s used (allowed, limit: $%s)\n' "$dollars" "$monthly_limit"
+        else
+          printf 'overage: $%s used (allowed)\n' "$dollars"
+        fi
+      else
+        printf 'overage: %s %s used (allowed)\n' "$used_credits" "$currency"
+      fi
+    fi
+  else
+    echo "models: aggregate only (no per-model data — bishop-fetch-usage failed)"
+  fi
+
   exit 0
 }
 
@@ -238,7 +508,6 @@ _bishop_get() {
 
 _bishop_install_agent() {
   local plist_template plist_dest bin_path real_bin
-  # Resolve symlinks to find the real script location
   real_bin="${BASH_SOURCE[0]}"
   if command -v readlink >/dev/null 2>&1; then
     real_bin="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
@@ -258,7 +527,6 @@ _bishop_install_agent() {
       -e "s|__HOME__|${HOME}|g" \
       "$plist_template" > "$plist_dest"
 
-  # Unload if loaded, then load fresh (idempotent)
   launchctl bootout "gui/$(id -u)/com.user.bishop.refresh" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$plist_dest"
 
@@ -290,8 +558,9 @@ _bishop_help() {
 bishop — Claude Code budget-posture producer
 
 USAGE
-  bishop --refresh              Compute posture from rate-limits source and
-                                write ~/.claude/budget-posture.json (atomic,
+  bishop --refresh              Compute posture from OAuth usage endpoint (or
+                                Mother aggregate fallback) and write
+                                ~/.claude/budget-posture.json (atomic,
                                 idempotent, safe to run concurrently).
 
   bishop status                 Print human-readable posture summary.
@@ -300,6 +569,7 @@ USAGE
   bishop get <field>            Print a single field (dot-path supported).
                                 E.g.: bishop get posture
                                       bishop get five_hour.level
+                                      bishop get models.sonnet.status
 
   bishop install-agent          Install and start the launchd agent that runs
                                 bishop --refresh every 60 seconds.
@@ -313,13 +583,34 @@ POSTURE LEVELS
   elevated      Pace < expected. Budget headroom available.
   flush         Well under pace. Free to use expensive models.
 
+DATA SOURCES
+  Primary: Anthropic OAuth /api/oauth/usage endpoint (per-model visibility).
+    Header: anthropic-beta: oauth-2025-04-20
+    Auth:   macOS keychain, service "Claude Code-credentials".
+  Fallback: ~/.mother/rate-limits.json (Mother aggregate, aggregate-only).
+
+  Requires macOS keychain access. On Linux or where the keychain entry is
+  absent, falls back to the Mother aggregate source automatically.
+
+  The launchd agent runs every 60 seconds. Bishop caches the OAuth response
+  for BISHOP_USAGE_CACHE_TTL_SECONDS (default 55s) to avoid redundant
+  fetches and to degrade gracefully under rate limits (HTTP 429).
+
 ENVIRONMENT VARIABLES
-  BISHOP_SOURCE_PATH            Rate-limits input (default: ~/.mother/rate-limits.json)
-  BISHOP_OUTPUT_PATH            Posture output   (default: ~/.claude/budget-posture.json)
-  BISHOP_SOURCE_STALE_SECONDS   Input age before marking stale_input=true (default: 600)
+  BISHOP_SOURCE_PATH            Mother aggregate input
+                                (default: ~/.mother/rate-limits.json)
+  BISHOP_OUTPUT_PATH            Posture output
+                                (default: ~/.claude/budget-posture.json)
+  BISHOP_SOURCE_STALE_SECONDS   Input age before marking stale_input=true
+                                (default: 600)
   BISHOP_DISABLED               Set to any value to skip --refresh entirely.
   BISHOP_NOW_OVERRIDE           Override current epoch (testing).
-  BISHOP_MTIME_OVERRIDE         Override source file mtime (testing).
+  BISHOP_MTIME_OVERRIDE         Override source file mtime (testing, legacy path).
+  BISHOP_USAGE_FETCH_CMD        Path to bishop-fetch-usage helper
+                                (default: alongside bishop binary).
+  BISHOP_USAGE_CACHE_PATH       Cached OAuth usage response
+                                (default: ~/.claude/oauth-usage.json).
+  BISHOP_USAGE_CACHE_TTL_SECONDS  Max age before re-fetching (default: 55).
 EOF
   exit 0
 }

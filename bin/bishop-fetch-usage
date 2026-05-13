@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# bishop-fetch-usage — pull proactive per-model utilization from Anthropic OAuth endpoint
+#
+# Exit codes:
+#   0  success — JSON body printed to stdout
+#   1  general failure (network, malformed response, auth)
+#   2  no OAuth token found in macOS keychain
+#   3  rate-limited (429) — caller should keep stale cached data
+#
+# macOS only: token lives in Keychain at service "Claude Code-credentials".
+# On Linux or where the entry is absent the caller should fall back to the
+# Mother aggregate source.
+
+set -uo pipefail
+
+OAUTH_URL="https://api.anthropic.com/api/oauth/usage"
+KEYCHAIN_SERVICE="Claude Code-credentials"
+
+# ---------------------------------------------------------------------------
+# 1. Pull token from macOS keychain
+# ---------------------------------------------------------------------------
+_token=""
+if command -v security >/dev/null 2>&1; then
+  _raw="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+  if [[ -n "$_raw" ]]; then
+    _token="$(printf '%s' "$_raw" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)"
+  fi
+fi
+
+if [[ -z "${_token:-}" ]]; then
+  echo "bishop-fetch-usage: no OAuth token found in keychain (service: $KEYCHAIN_SERVICE)" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Hit the endpoint
+# ---------------------------------------------------------------------------
+_response=""
+_http_code=""
+
+# Use a temp file to capture body + http_code simultaneously
+_tmp="$(mktemp /tmp/bishop-fetch-usage.XXXXXX)"
+trap 'rm -f "$_tmp"' EXIT
+
+_http_code="$(curl -sS --max-time 10 \
+  -o "$_tmp" \
+  -w "%{http_code}" \
+  -H "Authorization: Bearer ${_token}" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  "$OAUTH_URL" 2>&1)" || {
+  echo "bishop-fetch-usage: curl failed" >&2
+  exit 1
+}
+
+_response="$(cat "$_tmp")"
+
+# ---------------------------------------------------------------------------
+# 3. Evaluate response
+# ---------------------------------------------------------------------------
+
+# Rate-limited → exit 3 so caller keeps stale data
+if [[ "$_http_code" == "429" ]]; then
+  echo "bishop-fetch-usage: rate-limited (429) — keeping stale cache" >&2
+  exit 3
+fi
+
+# Non-200 → general failure
+if [[ "$_http_code" != "200" ]]; then
+  echo "bishop-fetch-usage: HTTP $_http_code from $OAUTH_URL" >&2
+  exit 1
+fi
+
+# Validate JSON
+if ! printf '%s' "$_response" | jq -e . >/dev/null 2>&1; then
+  echo "bishop-fetch-usage: malformed JSON in response" >&2
+  exit 1
+fi
+
+# Check for rate_limit_error in body (some 200 responses carry this)
+_err_type="$(printf '%s' "$_response" | jq -r '.error.type // empty' 2>/dev/null || true)"
+if [[ "$_err_type" == "rate_limit_error" ]]; then
+  echo "bishop-fetch-usage: rate_limit_error in response body" >&2
+  exit 3
+fi
+
+# Success
+printf '%s\n' "$_response"
+exit 0
