@@ -6,7 +6,7 @@ consumer (Mother, Claudia, scripts) can read in one syscall.
 
 Named after the synthetic from *Aliens*, the same franchise as Mother. Bishop
 is not an agent; it is a non-interactive CLI and an optional launchd heartbeat.
-It never crashes, never blocks, and degrades silently to `posture: On pace` when
+It never crashes, never blocks, and degrades silently to `posture: Cruise` when
 input is missing.
 
 ## Install
@@ -64,13 +64,13 @@ main posture computation (but it remains on disk as a backstop).
 {
   "ts": "2024-11-14T22:13:20Z",
   "source": "oauth_usage",
-  "posture": "On pace",
+  "posture": "Cruise",
   "five_hour": {
     "used_pct": 12,
     "elapsed_pct": 50.0,
     "pace": 0.24,
     "resets_at": 1700009000,
-    "level": "Full speed"
+    "level": "Put the hammer down"
   },
   "seven_day": {
     "used_pct": 71,
@@ -121,16 +121,19 @@ A model entry is `null` when either: the OAuth response has `seven_day_<name>: n
 
 ## Posture levels
 
-| Level               | Meaning                                                       |
-|---------------------|---------------------------------------------------------------|
-| `Pump the brakes`   | Pace exceeds budget. Use cheaper models; avoid heavy tasks.   |
-| `On pace`           | On track. No change to model selection.                       |
-| `Push`              | Below expected pace. Some headroom available.                 |
-| `Full speed`        | Well under pace. Budget is ample; expensive models are fine.  |
+Five tiers, severity left → right. Top-level `posture` is the *most cautious*
+level across both windows.
 
-The top-level `posture` is the *most cautious* level across both windows.
+| Level                  | 5h pace      | 7d pace      | Meaning                                                       |
+|------------------------|--------------|--------------|---------------------------------------------------------------|
+| `Pump the brakes`      | > 1.4        | > 1.3        | Way over pace. Slow down — use cheaper models, defer heavy work. |
+| `Ease up`              | 1.1 – 1.4    | 1.0 – 1.3    | Drifting hot. Course-correct now before it gets worse.        |
+| `Cruise`               | 0.85 – 1.1   | 0.85 – 1.0   | On track. No change to model selection.                       |
+| `Push`                 | 0.6 – 0.85   | 0.6 – 0.85   | Below pace. Some headroom available.                          |
+| `Put the hammer down`  | < 0.6        | < 0.6        | Well under pace. Budget is ample; expensive models are fine.  |
+
 `stale_input: true` (source older than `BISHOP_SOURCE_STALE_SECONDS`) forces
-`posture` to `"On pace"` as a safe default.
+`posture` to `"Cruise"` as a safe default.
 
 ## CLI reference
 
