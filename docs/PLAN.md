@@ -16,14 +16,14 @@ Bishop is a small, standalone shell tool that turns the rolling rate-limit
 data into a single normalized JSON file (`~/.claude/budget-posture.json`)
 any consumer can read in one syscall. It computes a per-window "pace"
 (used vs. elapsed window time) and rolls the two windows up to a
-top-level posture (`conservative` / `normal` / `elevated` / `flush`).
+top-level posture (`Pump the brakes` / `On pace` / `Push` / `Full speed`).
 Mother will read the posture to bias model/effort selection at job spawn;
 Claudia will read it at startup to tune recommendations.
 
 Bishop is named after the synthetic from *Aliens* — the same franchise as
 Mother. It is **not** an agent: it is a non-interactive CLI plus an
 optional launchd heartbeat. It never crashes, never blocks, and degrades
-silently to "posture: normal" when input is missing.
+silently to "posture: On pace" when input is missing.
 
 The data source already exists:
 `~/Code/mother/plugins/mother/statusline/segment.sh` defines
@@ -265,14 +265,14 @@ Cases (all 10 from spec):
    the four levels.
 6. **`status` includes age** — assert stdout matches the regex
    `^[a-z]+ \(5h: [a-z]+ · 7d: [a-z]+ · age [0-9]+s\)$`.
-7. **just-reset window → `normal`** — fixture `resets_at` ≈ now +
+7. **just-reset window → `On pace`** — fixture `resets_at` ≈ now +
    window_seconds (so elapsed < 2%), assert that window's level is
-   `normal` regardless of used_percentage.
+   `On pace` regardless of used_percentage.
 8. **past `resets_at` → elapsed treated as 100** — fixture
    `resets_at` in the past, assert `elapsed_pct == 100` and pace
    computed against 100.
-9. **conservative wins over flush** — fixture where 5h is `flush` and
-   7d is `conservative`, assert top-level
+9. **conservative wins over flush** — fixture where 5h is `Full speed` and
+   7d is `Pump the brakes`, assert top-level
    `posture == "conservative"`.
 10. **concurrent refreshes don't tear** — spawn two `--refresh &` in
     background, wait, assert output file is valid JSON
@@ -366,11 +366,11 @@ ignore failure), then `bishop get posture`. Map posture to a tier
 adjustment relative to the resolved tier from
 `current_tier`/`suggested_config`:
 
-- `conservative` → clamp to `tier_0` (sonnet/medium); log a one-line
+- `Pump the brakes` → clamp to `tier_0` (sonnet/medium); log a one-line
   warning if the resolved tier was higher.
-- `normal` → no change.
-- `elevated` → bump +1 tier, capped at `tier_2`.
-- `flush` → bump +1 tier, capped at `tier_3` (opus/high).
+- `On pace` → no change.
+- `Push` → bump +1 tier, capped at `tier_2`.
+- `Full speed` → bump +1 tier, capped at `tier_3` (opus/high).
 
 **Failure-escalation interaction:** posture bias applies first, then
 `escalation_count` from prior failures applies on top. Escalation
@@ -406,9 +406,9 @@ herd.
 
 Edit `~/.claude/agents/claudia.md`. Add startup instruction: read
 `~/.claude/budget-posture.json` (or run `bishop status --json`). If
-posture is `conservative`, surface it to the user and prefer
-sonnet-tier suggestions. If `flush`, freely recommend opus for hard
-problems. If `normal`, file missing, or `stale_input: true`, behave as
+posture is `Pump the brakes`, surface it to the user and prefer
+sonnet-tier suggestions. If `Full speed`, freely recommend opus for hard
+problems. If `On pace`, file missing, or `stale_input: true`, behave as
 today.
 
 ### M5 — Document the consumer relationship

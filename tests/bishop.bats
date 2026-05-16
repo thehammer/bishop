@@ -30,7 +30,7 @@ setup() {
   # Dummy nonexistent fetch cmd — existing tests force the Mother-aggregate path
   FETCH_DISABLED="${TEST_DIR}/no-such-fetch"
 
-  # Write a default "normal" fixture for the Mother-aggregate path
+  # Write a default "Cruise" fixture for the Mother-aggregate path
   cat > "$SOURCE_PATH" <<EOF
 {"five_hour":{"used_percentage":50,"resets_at":${FIVE_HOUR_RESETS_HALF}},"seven_day":{"used_percentage":50,"resets_at":${SEVEN_DAY_RESETS_HALF}}}
 EOF
@@ -106,8 +106,9 @@ JSON
   [ -f "$OUTPUT_PATH" ]
 
   posture="$(jq -r '.posture' "$OUTPUT_PATH")"
-  [[ "$posture" == "conservative" || "$posture" == "normal" || \
-     "$posture" == "elevated"     || "$posture" == "flush"  ]]
+  [[ "$posture" == "Pump the brakes" || "$posture" == "Ease up" || \
+     "$posture" == "Cruise"   || "$posture" == "Push" || \
+     "$posture" == "Put the hammer down"  ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -141,9 +142,9 @@ JSON
 }
 
 # ---------------------------------------------------------------------------
-# 4. Stale input flags stale_input: true and forces posture to "normal"
+# 4. Stale input flags stale_input: true and forces posture to "Cruise"
 # ---------------------------------------------------------------------------
-@test "stale input sets stale_input=true and posture=normal" {
+@test "stale input sets stale_input=true and posture=On pace" {
   # Mtime older than BISHOP_SOURCE_STALE_SECONDS (600)
   export BISHOP_MTIME_OVERRIDE=$((FIXED_NOW - 601))
 
@@ -155,7 +156,7 @@ JSON
   posture="$(jq -r '.posture' "$OUTPUT_PATH")"
 
   [ "$stale" = "true" ]
-  [ "$posture" = "normal" ]
+  [ "$posture" = "Cruise" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -167,8 +168,9 @@ JSON
 
   run "$BISHOP_BIN" get posture
   [ "$status" -eq 0 ]
-  [[ "$output" == "conservative" || "$output" == "normal" || \
-     "$output" == "elevated"     || "$output" == "flush"  ]]
+  [[ "$output" == "Pump the brakes" || "$output" == "Ease up" || \
+     "$output" == "Cruise"   || "$output" == "Push" || \
+     "$output" == "Put the hammer down"  ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -182,13 +184,14 @@ JSON
   [ "$status" -eq 0 ]
   # First line: "posture (5h: level · 7d: level · age Ns)"
   first_line="$(printf '%s' "$output" | head -1)"
-  [[ "$first_line" =~ ^[a-z]+\ \(5h:\ [a-z]+\ ·\ 7d:\ [a-z]+\ ·\ age\ [0-9]+s\)$ ]]
+  # posture/level strings can contain spaces and mixed case (e.g. "Cruise", "Pump the brakes")
+  [[ "$first_line" =~ ^[A-Za-z\ ]+\ \(5h:\ [A-Za-z\ ]+\ ·\ 7d:\ [A-Za-z\ ]+\ ·\ age\ [0-9]+s\)$ ]]
 }
 
 # ---------------------------------------------------------------------------
-# 7. Just-reset window → elapsed < 2% → level = "normal"
+# 7. Just-reset window → elapsed < 2% → level = "Cruise"
 # ---------------------------------------------------------------------------
-@test "just-reset window: elapsed < 2pct yields level=normal for that window" {
+@test "just-reset window: elapsed < 2pct yields level=On pace for that window" {
   # resets_at very far in future → elapsed ≈ 0% (well below 2%)
   local far_future=$((FIXED_NOW + 17999))  # 1 second into the 5h window
   local far_future_7d=$((FIXED_NOW + 604799))  # 1 second into the 7d window
@@ -204,9 +207,9 @@ EOF
   fh_level="$(jq -r '.five_hour.level' "$OUTPUT_PATH")"
   sd_level="$(jq -r '.seven_day.level' "$OUTPUT_PATH")"
 
-  # When elapsed < 2%, pace=null → level forced to "normal"
-  [ "$fh_level" = "normal" ]
-  [ "$sd_level" = "normal" ]
+  # When elapsed < 2%, pace=null → level forced to "Cruise"
+  [ "$fh_level" = "Cruise" ]
+  [ "$sd_level" = "Cruise" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -231,10 +234,10 @@ EOF
 # ---------------------------------------------------------------------------
 # 9. Conservative wins over flush (most urgent posture wins)
 # ---------------------------------------------------------------------------
-@test "conservative posture beats flush: top-level=conservative" {
+@test "Pump the brakes beats Full speed: top-level=Pump the brakes" {
   # 5h: flush (used=10, elapsed≈80% → pace=10/80=0.125 < 0.6)
   local fh_resets=$((FIXED_NOW + 3600))    # 14400s into 18000s window → elapsed=80%
-  # 7d: conservative (used=90, elapsed≈70% → pace=90/70=1.286 > 1.1)
+  # 7d: Pump the brakes (used=90, elapsed≈70% → pace=90/70=1.286 > 1.1)
   local sd_resets=$((FIXED_NOW + 181440))  # 423360s into 604800s window → elapsed=70%
 
   cat > "$BISHOP_SOURCE_PATH" <<EOF
@@ -249,9 +252,9 @@ EOF
   sd_level="$(jq -r '.seven_day.level' "$OUTPUT_PATH")"
   posture="$(jq -r '.posture' "$OUTPUT_PATH")"
 
-  [ "$fh_level" = "flush" ]
-  [ "$sd_level" = "conservative" ]
-  [ "$posture" = "conservative" ]
+  [ "$fh_level" = "Put the hammer down" ]
+  [ "$sd_level" = "Pump the brakes" ]
+  [ "$posture" = "Pump the brakes" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -445,17 +448,17 @@ _write_mock() {
 }
 
 # ---------------------------------------------------------------------------
-# (g) OAuth source: posture math works correctly (conservative beats flush)
+# (g) OAuth source: posture math works correctly (Pump the brakes beats Full speed)
 # ---------------------------------------------------------------------------
 @test "OAuth: posture math works with OAuth source format" {
   # Construct an OAuth fixture where:
-  #   5h: utilization=10, resets_at far out → pace is low → flush
-  #   7d: utilization=90, resets_at closer   → pace is high → conservative
-  # Top-level posture must be conservative.
+  #   5h: utilization=10, elapsed≈80% → pace=0.125 → Put the hammer down
+  #   7d: utilization=95, elapsed≈70% → pace=1.357 → Pump the brakes (>1.3)
+  # Top-level posture must be "Pump the brakes" (worst of the two).
   #
   # FIXED_NOW=1700000000.  We need an ISO timestamp representing specific epochs.
-  local fh_resets=$((FIXED_NOW + 3600))    # elapsed≈80% → flush
-  local sd_resets=$((FIXED_NOW + 181440))  # elapsed≈70% → conservative
+  local fh_resets=$((FIXED_NOW + 3600))    # elapsed≈80%
+  local sd_resets=$((FIXED_NOW + 181440))  # elapsed≈70%
   local fh_iso sd_iso
   fh_iso="$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${fh_resets}, tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000+00:00'))")"
   sd_iso="$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${sd_resets}, tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000+00:00'))")"
@@ -463,7 +466,7 @@ _write_mock() {
   local fixture
   fixture="{
   \"five_hour\":        { \"utilization\": 10.0, \"resets_at\": \"${fh_iso}\" },
-  \"seven_day\":        { \"utilization\": 90.0, \"resets_at\": \"${sd_iso}\" },
+  \"seven_day\":        { \"utilization\": 95.0, \"resets_at\": \"${sd_iso}\" },
   \"seven_day_sonnet\": { \"utilization\": 50.0, \"resets_at\": \"${sd_iso}\" },
   \"seven_day_opus\":   null,
   \"seven_day_haiku\":  null,
@@ -482,7 +485,7 @@ _write_mock() {
   sd_level="$(jq -r '.seven_day.level' "$OUTPUT_PATH")"
   posture="$(jq -r '.posture' "$OUTPUT_PATH")"
 
-  [ "$fh_level" = "flush" ]
-  [ "$sd_level" = "conservative" ]
-  [ "$posture" = "conservative" ]
+  [ "$fh_level" = "Put the hammer down" ]
+  [ "$sd_level" = "Pump the brakes" ]
+  [ "$posture" = "Pump the brakes" ]
 }
