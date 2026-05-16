@@ -92,23 +92,23 @@ def compute_window(key; src; now):
       pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
       resets_at: $resets,
       level: (
-        if $pace == null then "normal"
+        if $pace == null then "On pace"
         elif key == "five_hour" then
-          (if $pace > 1.2 then "conservative"
-           elif $pace >= 0.85 then "normal"
-           elif $pace >= 0.6 then "elevated"
-           else "flush" end)
+          (if $pace > 1.2 then "Pump the brakes"
+           elif $pace >= 0.85 then "On pace"
+           elif $pace >= 0.6 then "Push"
+           else "Full speed" end)
         else
-          (if $pace > 1.1 then "conservative"
-           elif $pace >= 0.9 then "normal"
-           elif $pace >= 0.7 then "elevated"
-           else "flush" end)
+          (if $pace > 1.1 then "Pump the brakes"
+           elif $pace >= 0.9 then "On pace"
+           elif $pace >= 0.7 then "Push"
+           else "Full speed" end)
         end
       )
     };
 
 def posture_for(fh_level; sd_level):
-  (["conservative","normal","elevated","flush"]) as $rank
+  (["Pump the brakes","On pace","Push","Full speed"]) as $rank
   | ([fh_level, sd_level]
      | map(. as $l | {l: $l, r: ($rank | index($l))})
      | min_by(.r) | .l);
@@ -156,7 +156,7 @@ def model_entry(key):
 | {
     ts: ($now | todateiso8601),
     source: "oauth_usage",
-    posture: (if $stale_input then "normal" else $posture end),
+    posture: (if $stale_input then "On pace" else $posture end),
     five_hour: $fh,
     seven_day: $sd,
     models: { sonnet: $sonnet, opus: $opus, haiku: $haiku },
@@ -197,17 +197,17 @@ def compute_window(key; now):
       pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
       resets_at: $resets,
       level: (
-        if $pace == null then "normal"
+        if $pace == null then "On pace"
         elif key == "five_hour" then
-          (if $pace > 1.2 then "conservative"
-           elif $pace >= 0.85 then "normal"
-           elif $pace >= 0.6 then "elevated"
-           else "flush" end)
+          (if $pace > 1.2 then "Pump the brakes"
+           elif $pace >= 0.85 then "On pace"
+           elif $pace >= 0.6 then "Push"
+           else "Full speed" end)
         else
-          (if $pace > 1.1 then "conservative"
-           elif $pace >= 0.9 then "normal"
-           elif $pace >= 0.7 then "elevated"
-           else "flush" end)
+          (if $pace > 1.1 then "Pump the brakes"
+           elif $pace >= 0.9 then "On pace"
+           elif $pace >= 0.7 then "Push"
+           else "Full speed" end)
         end
       )
     };
@@ -215,7 +215,7 @@ def compute_window(key; now):
 . as $src
 | compute_window("five_hour"; $now) as $fh
 | compute_window("seven_day"; $now) as $sd
-| (["conservative","normal","elevated","flush"]) as $rank
+| (["Pump the brakes","On pace","Push","Full speed"]) as $rank
 | (
     [$fh.level, $sd.level]
     | map(. as $level | {l: $level, r: ($rank | index($level))})
@@ -234,7 +234,7 @@ def compute_window(key; now):
     source_age_seconds: ($now - $source_mtime),
     stale_input: ($now - $source_mtime > $stale_seconds)
   }
-| if .stale_input then .posture = "normal" else . end
+| if .stale_input then .posture = "On pace" else . end
 '
 
 # ---------------------------------------------------------------------------
@@ -578,10 +578,10 @@ USAGE
   bishop --help                 Show this help.
 
 POSTURE LEVELS
-  conservative  Pace > expected. Slow down — use cheaper models.
-  normal        On track. Normal model selection.
-  elevated      Pace < expected. Budget headroom available.
-  flush         Well under pace. Free to use expensive models.
+  Pump the brakes  Pace > expected. Slow down — use cheaper models.
+  On pace          On track. Normal model selection.
+  Push             Pace < expected. Budget headroom available.
+  Full speed       Well under pace. Free to use expensive models.
 
 DATA SOURCES
   Primary: Anthropic OAuth /api/oauth/usage endpoint (per-model visibility).
