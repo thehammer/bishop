@@ -14,10 +14,13 @@ set -euo pipefail
 : "${BISHOP_USAGE_FETCH_CMD:=$(dirname "$0")/bishop-fetch-usage}"
 : "${BISHOP_USAGE_CACHE_PATH:=$HOME/.claude/oauth-usage.json}"
 : "${BISHOP_USAGE_CACHE_TTL_SECONDS:=55}"
+: "${BISHOP_PACE_SMOOTH_WINDOW_SECONDS:=2700}"
+: "${BISHOP_PACE_SMOOTH_MIN_SAMPLES:=3}"
 
 LOCK_PATH="${BISHOP_OUTPUT_PATH}.lock"
 ERR_LOG="${HOME}/.claude/budget-posture.errors.log"
 STATE_PATH="${BISHOP_OUTPUT_PATH}.state"
+PACE_HISTORY_PATH="${BISHOP_OUTPUT_PATH}.pace-history.json"
 ERR_LOG_MAX=102400  # 100 KB
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,37 @@ def parse_iso:
 
 def window_seconds(key): if key == "five_hour" then 18000 else 604800 end;
 
+def level_for(key; p):
+  if key == "five_hour" then
+    (if p > 1.4 then "Pump the brakes"
+     elif p > 1.1 then "Ease up"
+     elif p >= 0.85 then "Cruise"
+     elif p >= 0.6 then "Push"
+     else "Put the hammer down" end)
+  else
+    (if p > 1.3 then "Pump the brakes"
+     elif p > 1.0 then "Ease up"
+     elif p >= 0.85 then "Cruise"
+     elif p >= 0.6 then "Push"
+     else "Put the hammer down" end)
+  end;
+
+# Plan name is inferred from token limits, not reported by the API. The OAuth
+# usage endpoint currently returns only utilization percentages (no absolute
+# limit), so plan is null in practice. Thresholds are approximate; ambiguous.
+def plan_name(fh; sd):
+  if sd == null then null
+  elif sd >= 1500000 then "Max 20x"
+  elif sd >= 300000  then "Max 5x"
+  else "Pro"
+  end;
+
+def posture_for(fh_level; sd_level):
+  (["Pump the brakes","Ease up","Cruise","Push","Put the hammer down"]) as $rank
+  | ([fh_level, sd_level]
+     | map(. as $l | {l: $l, r: ($rank | index($l))})
+     | min_by(.r) | .l);
+
 def compute_window(key; src; now):
   src[key] as $w
   | window_seconds(key) as $ws
@@ -86,34 +120,20 @@ def compute_window(key; src; now):
   | (if $elapsed < 2 then null
      else ($used / (if $elapsed < 1 then 1 else $elapsed end))
      end) as $pace
+  | (if $pace == null or $used <= 0 or $used >= 100 then null
+     else
+       ($ws * ($elapsed / 100)) as $elapsed_secs
+       | (now + ($elapsed_secs * (100 - $used) / $used)) as $ee
+       | (if $ee >= $resets then null else ($ee | floor | todateiso8601) end)
+     end) as $projected_exhaustion
   | {
       used_pct: $used,
       elapsed_pct: ($elapsed | . * 10 | round / 10),
       pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
+      projected_exhaustion: $projected_exhaustion,
       resets_at: $resets,
-      level: (
-        if $pace == null then "Cruise"
-        elif key == "five_hour" then
-          (if $pace > 1.4 then "Pump the brakes"
-           elif $pace > 1.1 then "Ease up"
-           elif $pace >= 0.85 then "Cruise"
-           elif $pace >= 0.6 then "Push"
-           else "Put the hammer down" end)
-        else
-          (if $pace > 1.3 then "Pump the brakes"
-           elif $pace > 1.0 then "Ease up"
-           elif $pace >= 0.85 then "Cruise"
-           elif $pace >= 0.6 then "Push"
-           else "Put the hammer down" end)
-        end
-      )
+      level: (if $pace == null then "Cruise" else level_for(key; $pace) end)
     };
-
-def posture_for(fh_level; sd_level):
-  (["Pump the brakes","Ease up","Cruise","Push","Put the hammer down"]) as $rank
-  | ([fh_level, sd_level]
-     | map(. as $l | {l: $l, r: ($rank | index($l))})
-     | min_by(.r) | .l);
 
 def model_entry(key):
   .[key] as $bucket
@@ -144,7 +164,22 @@ def model_entry(key):
   } as $normalized
 | compute_window("five_hour"; $normalized; $now) as $fh
 | compute_window("seven_day"; $normalized; $now) as $sd
-| posture_for($fh.level; $sd.level) as $posture
+
+# Pace smoothing: blend recent history with current reading
+| ([ $pace_history[] | select(($now - .ts) <= $smooth_window) ]) as $recent
+| (($recent | map(.fh) | map(select(. != null))) + (if $fh.pace == null then [] else [$fh.pace] end)) as $fh_samples
+| (($recent | map(.sd) | map(select(. != null))) + (if $sd.pace == null then [] else [$sd.pace] end)) as $sd_samples
+| (if ($fh_samples | length) >= $smooth_min
+   then (($fh_samples | add) / ($fh_samples | length) * 100 | round / 100)
+   else null end) as $fh_smoothed
+| (if ($sd_samples | length) >= $smooth_min
+   then (($sd_samples | add) / ($sd_samples | length) * 100 | round / 100)
+   else null end) as $sd_smoothed
+
+# Smoothed level drives posture roll-up; fall back to raw level when no smoothed value
+| (if $fh_smoothed == null then $fh.level else level_for("five_hour"; $fh_smoothed) end) as $fh_eff_level
+| (if $sd_smoothed == null then $sd.level else level_for("seven_day"; $sd_smoothed) end) as $sd_eff_level
+| posture_for($fh_eff_level; $sd_eff_level) as $posture
 
 | model_entry("seven_day_sonnet") as $sonnet
 | model_entry("seven_day_opus")   as $opus
@@ -159,10 +194,26 @@ def model_entry(key):
     ts: ($now | todateiso8601),
     source: "oauth_usage",
     posture: (if $stale_input then "Cruise" else $posture end),
-    five_hour: $fh,
-    seven_day: $sd,
+    five_hour: ($fh + {pace_smoothed: $fh_smoothed}),
+    seven_day: ($sd + {pace_smoothed: $sd_smoothed}),
     models: { sonnet: $sonnet, opus: $opus, haiku: $haiku },
     exhausted_models: $exhausted_models,
+    billing_mode: (if ($eu.is_enabled // false) and (($eu.used_credits // 0) > 0)
+                   then "metered" else "subscription" end),
+    overage: {
+      enabled: ($eu.is_enabled // false),
+      spent_usd: (if ($eu.used_credits // null) == null then null
+                  else (($eu.used_credits / 100) * 100 | round / 100) end),
+      monthly_limit_usd: ($eu.monthly_limit // null),
+      this_session_usd: null
+    },
+    subscription: {
+      plan: plan_name(($oauth.five_hour.limit // null); ($oauth.seven_day.limit // null)),
+      limits: {
+        five_hour: ($oauth.five_hour.limit // null),
+        seven_day: ($oauth.seven_day.limit // null)
+      }
+    },
     extra_usage: {
       is_enabled:    ($eu.is_enabled    // false),
       used_credits:  ($eu.used_credits  // null),
@@ -193,10 +244,17 @@ def compute_window(key; now):
   | (if $elapsed < 2 then null
      else ($used / (if $elapsed < 1 then 1 else $elapsed end))
      end) as $pace
+  | (if $pace == null or $used <= 0 or $used >= 100 then null
+     else
+       ($ws * ($elapsed / 100)) as $elapsed_secs
+       | (now + ($elapsed_secs * (100 - $used) / $used)) as $ee
+       | (if $ee >= $resets then null else ($ee | floor | todateiso8601) end)
+     end) as $projected_exhaustion
   | {
       used_pct: $used,
       elapsed_pct: ($elapsed | . * 10 | round / 10),
       pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
+      projected_exhaustion: $projected_exhaustion,
       resets_at: $resets,
       level: (
         if $pace == null then "Cruise"
@@ -229,10 +287,21 @@ def compute_window(key; now):
     ts: ($now | todateiso8601),
     source: "mother_aggregate",
     posture: $posture,
-    five_hour: $fh,
-    seven_day: $sd,
+    five_hour: ($fh + {pace_smoothed: null}),
+    seven_day: ($sd + {pace_smoothed: null}),
     models: { sonnet: null, opus: null, haiku: null },
     exhausted_models: [],
+    billing_mode: "subscription",
+    overage: {
+      enabled: false,
+      spent_usd: null,
+      monthly_limit_usd: null,
+      this_session_usd: null
+    },
+    subscription: {
+      plan: null,
+      limits: { five_hour: null, seven_day: null }
+    },
     extra_usage: null,
     source_mtime: ($source_mtime | todateiso8601),
     source_age_seconds: ($now - $source_mtime),
@@ -268,6 +337,13 @@ _bishop_refresh() {
 
   local tmp_output
   tmp_output="${BISHOP_OUTPUT_PATH}.tmp.$$"
+
+  # Read pace history for smoothed-pace computation on the OAuth path
+  local pace_history="[]"
+  if [[ -f "$PACE_HISTORY_PATH" ]]; then
+    pace_history="$(cat "$PACE_HISTORY_PATH" 2>/dev/null || echo '[]')"
+    [[ -z "$pace_history" ]] && pace_history="[]"
+  fi
 
   # -------------------------------------------------------------------------
   # OAuth path: try bishop-fetch-usage with TTL-based cache
@@ -338,8 +414,29 @@ _bishop_refresh() {
         --argjson now "$now" \
         --argjson source_mtime "$cache_mtime" \
         --argjson stale_input "$stale_input" \
+        --argjson pace_history "$pace_history" \
+        --argjson smooth_window "$BISHOP_PACE_SMOOTH_WINDOW_SECONDS" \
+        --argjson smooth_min "$BISHOP_PACE_SMOOTH_MIN_SAMPLES" \
         "$_BISHOP_OAUTH_JQ_PROGRAM" > "$tmp_output" 2>/dev/null; then
       mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
+
+      # Update pace history (failure must not affect exit code — never-crash contract)
+      local fh_pace sd_pace
+      fh_pace="$(jq -r '.five_hour.pace // empty' "$BISHOP_OUTPUT_PATH" 2>/dev/null || true)"
+      sd_pace="$(jq -r '.seven_day.pace // empty' "$BISHOP_OUTPUT_PATH" 2>/dev/null || true)"
+      local tmp_hist="${PACE_HISTORY_PATH}.tmp.$$"
+      if printf '%s' "$pace_history" | jq \
+          --argjson now "$now" \
+          --argjson win "$BISHOP_PACE_SMOOTH_WINDOW_SECONDS" \
+          --argjson fh "${fh_pace:-null}" \
+          --argjson sd "${sd_pace:-null}" \
+          '(. + [{ts:$now, fh:$fh, sd:$sd}]) | map(select(($now - .ts) <= $win)) | .[-120:]' \
+          > "$tmp_hist" 2>/dev/null; then
+        mv "$tmp_hist" "$PACE_HISTORY_PATH"
+      else
+        rm -f "$tmp_hist"
+      fi
+
       exit 0
     else
       _bishop_log_err "jq failed parsing OAuth data; falling back to Mother aggregate"
@@ -581,11 +678,40 @@ USAGE
 
   bishop --help                 Show this help.
 
-POSTURE LEVELS
-  Pump the brakes  Pace > expected. Slow down — use cheaper models.
-  On pace          On track. Normal model selection.
-  Push             Pace < expected. Budget headroom available.
-  Full speed       Well under pace. Free to use expensive models.
+POSTURE LEVELS (most urgent → least urgent)
+  Pump the brakes  Pace well above expected. Slow down — use cheaper models.
+  Ease up          Pace above expected. Consider lighter model selection.
+  Cruise           On pace. Normal model selection.
+  Push             Pace below expected. Budget headroom available.
+  Put the hammer down  Well under pace. Free to use expensive models.
+
+OUTPUT FIELDS (budget-posture.json)
+  posture               Top-level posture string (most urgent window wins).
+  five_hour / seven_day Per-window objects, each containing:
+    used_pct              Usage consumed this window (%).
+    elapsed_pct           Time elapsed in window (%).
+    pace                  Raw pace ratio (used% / elapsed%; 1.0 = on pace).
+    pace_smoothed         Rolling average pace over smooth window, or null if
+                          fewer than BISHOP_PACE_SMOOTH_MIN_SAMPLES samples.
+                          Drives posture level when non-null.
+    projected_exhaustion  ISO 8601 UTC timestamp when quota will reach 100% at
+                          current pace, or null if sustainable / window resets
+                          before exhaustion.
+    resets_at             Epoch when this window resets.
+    level                 Posture level for this window.
+  billing_mode          "subscription" or "metered" (metered = overage incurred).
+  overage               Overage block:
+    enabled               true if overage spend is permitted.
+    spent_usd             Dollars spent via overage this period, or null.
+    monthly_limit_usd     Monthly overage cap in dollars, or null.
+    this_session_usd      Reserved; always null.
+  subscription          Subscription block:
+    plan                  Inferred plan name ("Pro", "Max 5x", "Max 20x"), or
+                          null (OAuth endpoint does not report limits directly).
+    limits                Token limits per window, or null.
+  extra_usage           Raw extra-usage block from OAuth response (backward compat).
+  models                Per-model quota objects (OAuth path only).
+  exhausted_models      Array of model names at 100% utilization.
 
 DATA SOURCES
   Primary: Anthropic OAuth /api/oauth/usage endpoint (per-model visibility).
@@ -615,6 +741,10 @@ ENVIRONMENT VARIABLES
   BISHOP_USAGE_CACHE_PATH       Cached OAuth usage response
                                 (default: ~/.claude/oauth-usage.json).
   BISHOP_USAGE_CACHE_TTL_SECONDS  Max age before re-fetching (default: 55).
+  BISHOP_PACE_SMOOTH_WINDOW_SECONDS  History horizon for pace smoothing in
+                                seconds (default: 2700 = 45 minutes).
+  BISHOP_PACE_SMOOTH_MIN_SAMPLES  Minimum samples before emitting pace_smoothed
+                                (default: 3). Fewer samples → null.
 EOF
   exit 0
 }
