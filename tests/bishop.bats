@@ -237,11 +237,11 @@ EOF
 @test "Pump the brakes beats Full speed: top-level=Pump the brakes" {
   # 5h: flush (used=10, elapsed≈80% → pace=10/80=0.125 < 0.6)
   local fh_resets=$((FIXED_NOW + 3600))    # 14400s into 18000s window → elapsed=80%
-  # 7d: Pump the brakes (used=90, elapsed≈70% → pace=90/70=1.286 > 1.1)
+  # 7d: Pump the brakes (used=95, elapsed≈70% → pace=95/70=1.357 > 1.3)
   local sd_resets=$((FIXED_NOW + 181440))  # 423360s into 604800s window → elapsed=70%
 
   cat > "$BISHOP_SOURCE_PATH" <<EOF
-{"five_hour":{"used_percentage":10,"resets_at":${fh_resets}},"seven_day":{"used_percentage":90,"resets_at":${sd_resets}}}
+{"five_hour":{"used_percentage":10,"resets_at":${fh_resets}},"seven_day":{"used_percentage":95,"resets_at":${sd_resets}}}
 EOF
 
   run "$BISHOP_BIN" --refresh
@@ -488,4 +488,338 @@ _write_mock() {
   [ "$fh_level" = "Put the hammer down" ]
   [ "$sd_level" = "Pump the brakes" ]
   [ "$posture" = "Pump the brakes" ]
+}
+
+# ===========================================================================
+# New fields: billing_mode, overage, subscription, projected_exhaustion,
+# pace_smoothed (cases h–v, 15 tests)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper: build an OAuth fixture with specific ISO resets_at for window math
+# Params: fh_util fh_resets_epoch sd_util sd_resets_epoch extra_enabled extra_credits
+# ---------------------------------------------------------------------------
+_oauth_fixture_timed() {
+  local fh_util="$1" fh_epoch="$2" sd_util="$3" sd_epoch="$4"
+  local extra_enabled="${5:-false}" extra_credits="${6:-0}"
+  local fh_iso sd_iso
+  fh_iso="$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${fh_epoch}, tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000+00:00'))")"
+  sd_iso="$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${sd_epoch}, tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000+00:00'))")"
+  cat <<JSON
+{
+  "five_hour":        { "utilization": ${fh_util}, "resets_at": "${fh_iso}" },
+  "seven_day":        { "utilization": ${sd_util}, "resets_at": "${sd_iso}" },
+  "seven_day_sonnet": { "utilization": 50.0,        "resets_at": "${sd_iso}" },
+  "seven_day_opus":   null,
+  "seven_day_haiku":  null,
+  "extra_usage": {
+    "is_enabled":    ${extra_enabled},
+    "monthly_limit": null,
+    "used_credits":  ${extra_credits},
+    "utilization":   null,
+    "currency":      "USD"
+  }
+}
+JSON
+}
+
+# ---------------------------------------------------------------------------
+# (h) billing_mode subscription when overage disabled
+# ---------------------------------------------------------------------------
+@test "billing_mode subscription when overage disabled" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  billing_mode="$(jq -r '.billing_mode' "$OUTPUT_PATH")"
+  [ "$billing_mode" = "subscription" ]
+}
+
+# ---------------------------------------------------------------------------
+# (i) billing_mode metered when overage enabled and credits spent
+# ---------------------------------------------------------------------------
+@test "billing_mode metered when overage enabled and credits spent" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 true 500)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  billing_mode="$(jq -r '.billing_mode' "$OUTPUT_PATH")"
+  [ "$billing_mode" = "metered" ]
+}
+
+# ---------------------------------------------------------------------------
+# (j) billing_mode subscription when overage enabled but zero credits
+# ---------------------------------------------------------------------------
+@test "billing_mode subscription when overage enabled but zero credits" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 true 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  billing_mode="$(jq -r '.billing_mode' "$OUTPUT_PATH")"
+  [ "$billing_mode" = "subscription" ]
+}
+
+# ---------------------------------------------------------------------------
+# (k) overage block promoted with spent_usd in dollars
+# ---------------------------------------------------------------------------
+@test "overage block promoted with spent_usd in dollars" {
+  # 15650 cents = $156.50
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 true 15650)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  enabled="$(jq -r '.overage.enabled' "$OUTPUT_PATH")"
+  spent_usd="$(jq -r '.overage.spent_usd' "$OUTPUT_PATH")"
+  this_session="$(jq -r '.overage.this_session_usd' "$OUTPUT_PATH")"
+
+  [ "$enabled" = "true" ]
+  [ "$spent_usd" = "156.5" ]
+  [ "$this_session" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (l) overage block: enabled=false when overage disabled
+# ---------------------------------------------------------------------------
+@test "overage block null spend when disabled" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  enabled="$(jq -r '.overage.enabled' "$OUTPUT_PATH")"
+  [ "$enabled" = "false" ]
+}
+
+# ---------------------------------------------------------------------------
+# (m) subscription block present with null plan and limits; plus max-plan fixture
+# ---------------------------------------------------------------------------
+@test "subscription block present with null plan and limits; infers Max 20x" {
+  # Standard fixture — no .limit field on windows → plan=null
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  plan="$(jq -r '.subscription.plan' "$OUTPUT_PATH")"
+  fh_limit="$(jq -r '.subscription.limits.five_hour' "$OUTPUT_PATH")"
+  [ "$plan" = "null" ]
+  [ "$fh_limit" = "null" ]
+
+  # Inline fixture with seven_day.limit: 2000000 → infers "Max 20x"
+  # Clear OAuth cache so bishop re-fetches from the new mock (FIXED_NOW makes
+  # cache_age negative, so the old cache would otherwise appear "fresh").
+  rm -f "$CACHE_PATH"
+  local max_fixture
+  max_fixture='{
+    "five_hour":        { "utilization": 50.0, "resets_at": "'"$OAUTH_RESETS_FUTURE"'", "limit": null },
+    "seven_day":        { "utilization": 50.0, "resets_at": "'"$OAUTH_RESETS_FUTURE"'", "limit": 2000000 },
+    "seven_day_sonnet": { "utilization": 50.0, "resets_at": "'"$OAUTH_RESETS_FUTURE"'" },
+    "seven_day_opus":   null,
+    "seven_day_haiku":  null,
+    "extra_usage": { "is_enabled": false, "monthly_limit": null, "used_credits": 0, "utilization": null, "currency": "USD" }
+  }'
+  _write_mock "$max_fixture"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  plan="$(jq -r '.subscription.plan' "$OUTPUT_PATH")"
+  sd_limit="$(jq -r '.subscription.limits.seven_day' "$OUTPUT_PATH")"
+  [ "$plan" = "Max 20x" ]
+  [ "$sd_limit" = "2000000" ]
+}
+
+# ---------------------------------------------------------------------------
+# (n) projected_exhaustion null when pace is sustainable (ee >= resets)
+# ---------------------------------------------------------------------------
+@test "projected_exhaustion null when pace sustainable" {
+  # fh: used=10, elapsed=50% → pace=0.2 (sustainable) → ee far past resets → null
+  local fh_resets=$((FIXED_NOW + 9000))   # halfway through 18000s window
+  local sd_resets=$((FIXED_NOW + 302400)) # halfway through 604800s window
+  _write_mock "$(_oauth_fixture_timed 10.0 "$fh_resets" 10.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  pe="$(jq -r '.five_hour.projected_exhaustion' "$OUTPUT_PATH")"
+  [ "$pe" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (o) projected_exhaustion ISO timestamp when over-pace
+# ---------------------------------------------------------------------------
+@test "projected_exhaustion ISO timestamp when over-pace" {
+  # fh: used=80, elapsed=50% → pace=1.6 → ee = now + 9000*(20/80) = now+2250 < resets
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 80.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  pe="$(jq -r '.five_hour.projected_exhaustion' "$OUTPUT_PATH")"
+  [ "$pe" != "null" ]
+  [[ "$pe" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]
+}
+
+# ---------------------------------------------------------------------------
+# (p) projected_exhaustion null when utilization=100 (already exhausted)
+# ---------------------------------------------------------------------------
+@test "projected_exhaustion null when already exhausted" {
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 100.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  pe="$(jq -r '.five_hour.projected_exhaustion' "$OUTPUT_PATH")"
+  [ "$pe" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (q) pace_smoothed null on first refresh (no history); history file created
+# ---------------------------------------------------------------------------
+@test "pace_smoothed null on first refresh; history file created" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # With pace=null (elapsed=0%), and no history → 0 samples < smooth_min=3 → null
+  smoothed="$(jq -r '.five_hour.pace_smoothed' "$OUTPUT_PATH")"
+  [ "$smoothed" = "null" ]
+
+  # History file must be created with at least 1 sample
+  local hist_path="${OUTPUT_PATH}.pace-history.json"
+  [ -f "$hist_path" ]
+  sample_count="$(jq 'length' "$hist_path")"
+  [ "$sample_count" -ge 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# (r) pace_smoothed populated after enough history samples
+# ---------------------------------------------------------------------------
+@test "pace_smoothed populated after enough history samples" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+
+  # Pre-seed 3 in-horizon samples (each within 2700s of FIXED_NOW)
+  local hist_path="${OUTPUT_PATH}.pace-history.json"
+  printf '%s\n' '[
+    {"ts":'"$((FIXED_NOW - 100))"',"fh":0.5,"sd":0.7},
+    {"ts":'"$((FIXED_NOW - 200))"',"fh":0.6,"sd":0.8},
+    {"ts":'"$((FIXED_NOW - 300))"',"fh":0.4,"sd":0.6}
+  ]' > "$hist_path"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # 3 historical fh samples (current pace=null, elapsed=0%); 3 >= smooth_min=3 → smoothed
+  smoothed="$(jq -r '.five_hour.pace_smoothed' "$OUTPUT_PATH")"
+  [ "$smoothed" != "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (s) pace_smoothed ignores stale samples (outside smooth window)
+# ---------------------------------------------------------------------------
+@test "pace_smoothed ignores stale samples outside smooth window" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+
+  # Pre-seed 3 samples all older than 2700s
+  local hist_path="${OUTPUT_PATH}.pace-history.json"
+  printf '%s\n' '[
+    {"ts":'"$((FIXED_NOW - 3000))"',"fh":0.5,"sd":0.7},
+    {"ts":'"$((FIXED_NOW - 3100))"',"fh":0.6,"sd":0.8},
+    {"ts":'"$((FIXED_NOW - 3200))"',"fh":0.4,"sd":0.6}
+  ]' > "$hist_path"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # All historical samples stale; current pace=null (elapsed=0%) → 0 valid samples → null
+  smoothed="$(jq -r '.five_hour.pace_smoothed' "$OUTPUT_PATH")"
+  [ "$smoothed" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (t) smoothed pace drives posture level (not raw pace)
+# ---------------------------------------------------------------------------
+@test "smoothed pace drives posture level when history present" {
+  # Standard fixture: elapsed=0% → raw pace=null → raw level="Cruise"
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+
+  # Seed 3 samples: fh=1.5 (>1.4 → 5h "Pump the brakes"), sd=1.5 (>1.3 → 7d "Pump the brakes")
+  local hist_path="${OUTPUT_PATH}.pace-history.json"
+  printf '%s\n' '[
+    {"ts":'"$((FIXED_NOW - 100))"',"fh":1.5,"sd":1.5},
+    {"ts":'"$((FIXED_NOW - 200))"',"fh":1.5,"sd":1.5},
+    {"ts":'"$((FIXED_NOW - 300))"',"fh":1.5,"sd":1.5}
+  ]' > "$hist_path"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # Smoothed fh=1.5 → level_for("five_hour",1.5)="Pump the brakes"; dominates raw "Cruise"
+  posture="$(jq -r '.posture' "$OUTPUT_PATH")"
+  [ "$posture" = "Pump the brakes" ]
+}
+
+# ---------------------------------------------------------------------------
+# (u) Mother-fallback shape: new fields present with correct defaults
+# ---------------------------------------------------------------------------
+@test "Mother-fallback shape has billing_mode, overage, subscription, pace_smoothed" {
+  # Default setup: no fetch cmd, no cache → Mother aggregate path
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  source="$(jq -r '.source' "$OUTPUT_PATH")"
+  [ "$source" = "mother_aggregate" ]
+
+  billing_mode="$(jq -r '.billing_mode' "$OUTPUT_PATH")"
+  [ "$billing_mode" = "subscription" ]
+
+  overage_enabled="$(jq -r '.overage.enabled' "$OUTPUT_PATH")"
+  [ "$overage_enabled" = "false" ]
+
+  plan="$(jq -r '.subscription.plan' "$OUTPUT_PATH")"
+  [ "$plan" = "null" ]
+
+  fh_smoothed="$(jq -r '.five_hour.pace_smoothed' "$OUTPUT_PATH")"
+  [ "$fh_smoothed" = "null" ]
+
+  sd_smoothed="$(jq -r '.seven_day.pace_smoothed' "$OUTPUT_PATH")"
+  [ "$sd_smoothed" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (v) backward-compat: extra_usage block still present and unchanged on OAuth path
+# ---------------------------------------------------------------------------
+@test "backward-compat: extra_usage block preserved on OAuth path" {
+  _write_mock "$(_oauth_fixture 100.0 null null 12.0 71.0 true 15650)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  source="$(jq -r '.source' "$OUTPUT_PATH")"
+  [ "$source" = "oauth_usage" ]
+
+  is_enabled="$(jq -r '.extra_usage.is_enabled' "$OUTPUT_PATH")"
+  used_credits="$(jq -r '.extra_usage.used_credits' "$OUTPUT_PATH")"
+
+  [ "$is_enabled" = "true" ]
+  [ "$used_credits" = "15650" ]
 }
