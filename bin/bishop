@@ -17,6 +17,10 @@ set -euo pipefail
 : "${BISHOP_PACE_SMOOTH_WINDOW_SECONDS:=2700}"
 : "${BISHOP_PACE_SMOOTH_MIN_SAMPLES:=3}"
 : "${BISHOP_MOTHER_RUNS_PATH:=$HOME/.mother/metrics/runs.jsonl}"
+: "${BISHOP_EVENTS_PATH:=$HOME/.claude/budget-posture.events.jsonl}"
+: "${BISHOP_EVENTS_MAX_BYTES:=1048576}"          # 1 MB — rotate beyond this
+: "${BISHOP_EXHAUSTION_IMMINENT_SECONDS:=1800}"  # 30 minutes
+: "${BISHOP_EVENT_TS_OVERRIDE:-}"                # testing only — pin event timestamps
 
 LOCK_PATH="${BISHOP_OUTPUT_PATH}.lock"
 ERR_LOG="${HOME}/.claude/budget-posture.errors.log"
@@ -106,6 +110,128 @@ _bishop_agents_json() {
            | .[$rec.stage].tokens_out_5h += $rec.tout
          else . end))
     ' "$runs_path" 2>/dev/null || echo '{}'
+}
+
+_bishop_append_event() {
+  local line="$1"
+  [[ -z "$line" ]] && return 0
+  local path="${BISHOP_EVENTS_PATH}"
+  local max="${BISHOP_EVENTS_MAX_BYTES:-1048576}"
+  if [[ -f "$path" ]]; then
+    local size
+    size="$(stat -f %z "$path" 2>/dev/null || echo 0)"
+    if [[ "$size" -ge "$max" ]]; then
+      mv "$path" "${path}.1" 2>/dev/null || true
+    fi
+  fi
+  local tmp="${path}.tmp.$$"
+  if [[ -f "$path" ]]; then
+    cat "$path" > "$tmp" 2>/dev/null || : > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s\n' "$line" >> "$tmp" 2>/dev/null || true
+  mv "$tmp" "$path" 2>/dev/null || rm -f "$tmp"
+  return 0
+}
+
+# Detect threshold crossings by comparing prev and new posture JSON.
+# Appends structured JSON-lines events to BISHOP_EVENTS_PATH.
+# Must never let errors escape — all error paths return 0.
+_bishop_emit_events() {
+  local prev_json="$1"
+  local now="$2"
+  local new_json
+  new_json="$(cat "${BISHOP_OUTPUT_PATH}" 2>/dev/null || true)"
+  [[ -z "$new_json" ]] && return 0
+
+  local event_ts="${BISHOP_EVENT_TS_OVERRIDE:-$(date -u +%FT%TZ)}"
+
+  local window
+  for window in five_hour seven_day; do
+    local prev_level new_level new_pace
+    new_level="$(printf '%s' "$new_json"  | jq -r ".${window}.level  // empty" 2>/dev/null || true)"
+    new_pace="$( printf '%s' "$new_json"  | jq -r ".${window}.pace   // empty" 2>/dev/null || true)"
+    [[ -z "$new_level" ]] && continue
+
+    local trigger=""
+    if [[ -n "$prev_json" ]]; then
+      prev_level="$(printf '%s' "$prev_json" | jq -r ".${window}.level // empty" 2>/dev/null || true)"
+
+      if [[ "$new_level" == "Pump the brakes" && "$prev_level" != "Pump the brakes" ]]; then
+        trigger="pace_critical"
+      elif [[ "$new_level" == "Ease up" && "$prev_level" != "Ease up" ]]; then
+        trigger="pace_warning"
+      elif [[ "$new_level" != "Pump the brakes" && "$new_level" != "Ease up" &&
+              ( "$prev_level" == "Pump the brakes" || "$prev_level" == "Ease up" ) ]]; then
+        trigger="pace_recovered"
+      fi
+    fi
+
+    if [[ -n "$trigger" ]]; then
+      local line
+      line="$(jq -c -n \
+        --arg ts "$event_ts" \
+        --arg window "$window" \
+        --arg trigger "$trigger" \
+        --argjson pace "${new_pace:-null}" \
+        '{ts:$ts,type:"threshold_crossed",window:$window,trigger:$trigger}
+         + (if $pace == null then {} else {pace:$pace} end)' 2>/dev/null || true)"
+      _bishop_append_event "$line" || true
+    fi
+
+    # Exhaustion imminence check (edge-triggered)
+    local new_pe prev_pe
+    new_pe="$(printf '%s' "$new_json"  | jq -r ".${window}.projected_exhaustion // empty" 2>/dev/null || true)"
+    if [[ -n "$new_pe" ]]; then
+      local new_pe_epoch secs_remaining
+      new_pe_epoch="$(printf '%s' "\"$new_pe\"" | jq -r 'fromdateiso8601' 2>/dev/null || true)"
+      if [[ -n "$new_pe_epoch" ]]; then
+        secs_remaining=$(( ${new_pe_epoch%.*} - now ))
+        if [[ "$secs_remaining" -lt "${BISHOP_EXHAUSTION_IMMINENT_SECONDS:-1800}" ]]; then
+          local already_imminent=0
+          if [[ -n "$prev_json" ]]; then
+            prev_pe="$(printf '%s' "$prev_json" | jq -r ".${window}.projected_exhaustion // empty" 2>/dev/null || true)"
+            if [[ -n "$prev_pe" ]]; then
+              local prev_pe_epoch prev_secs
+              prev_pe_epoch="$(printf '%s' "\"$prev_pe\"" | jq -r 'fromdateiso8601' 2>/dev/null || true)"
+              if [[ -n "$prev_pe_epoch" ]]; then
+                prev_secs=$(( ${prev_pe_epoch%.*} - now ))
+                [[ "$prev_secs" -lt "${BISHOP_EXHAUSTION_IMMINENT_SECONDS:-1800}" ]] && already_imminent=1
+              fi
+            fi
+          fi
+          if [[ "$already_imminent" -eq 0 ]]; then
+            local mins=$(( secs_remaining / 60 ))
+            local line
+            line="$(jq -c -n \
+              --arg ts "$event_ts" \
+              --arg window "$window" \
+              --argjson mins "$mins" \
+              '{ts:$ts,type:"threshold_crossed",window:$window,trigger:"exhaustion_imminent",minutes_remaining:$mins}' \
+              2>/dev/null || true)"
+            _bishop_append_event "$line" || true
+          fi
+        fi
+      fi
+    fi
+  done
+
+  # overage_started (top-level, edge-triggered)
+  if [[ -n "$prev_json" ]]; then
+    local prev_bm new_bm
+    new_bm="$( printf '%s' "$new_json"  | jq -r '.billing_mode // empty' 2>/dev/null || true)"
+    prev_bm="$(printf '%s' "$prev_json" | jq -r '.billing_mode // empty' 2>/dev/null || true)"
+    if [[ "$new_bm" == "metered" && "$prev_bm" != "metered" ]]; then
+      local line
+      line="$(jq -c -n \
+        --arg ts "$event_ts" \
+        '{ts:$ts,type:"threshold_crossed",window:"account",trigger:"overage_started"}' \
+        2>/dev/null || true)"
+      _bishop_append_event "$line" || true
+    fi
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -383,6 +509,12 @@ _bishop_refresh() {
   local now
   now="$(_bishop_now)"
 
+  # Capture previous posture BEFORE overwriting — used for edge-triggered events
+  local prev_posture_json=""
+  if [[ -f "${BISHOP_OUTPUT_PATH}" ]]; then
+    prev_posture_json="$(cat "${BISHOP_OUTPUT_PATH}" 2>/dev/null || true)"
+  fi
+
   local tmp_output
   tmp_output="${BISHOP_OUTPUT_PATH}.tmp.$$"
 
@@ -472,6 +604,7 @@ _bishop_refresh() {
         --argjson agents "$agents_json" \
         "$_BISHOP_OAUTH_JQ_PROGRAM" > "$tmp_output" 2>/dev/null; then
       mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
+      _bishop_emit_events "$prev_posture_json" "$now" || true
 
       # Update pace history (failure must not affect exit code — never-crash contract)
       local fh_pace sd_pace
@@ -528,6 +661,7 @@ _bishop_refresh() {
   fi
 
   mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
+  _bishop_emit_events "$prev_posture_json" "$now" || true
 
   local tmp_state
   tmp_state="${STATE_PATH}.tmp.$$"
@@ -773,6 +907,31 @@ OUTPUT FIELDS (budget-posture.json)
                         Interactive (non-Mother) sessions are not attributable.
                         Always {} on the Mother-aggregate fallback path.
 
+EVENTS (~/.claude/budget-posture.events.jsonl)
+  On each refresh, Bishop compares the new posture to the previous posture and
+  appends a JSON-lines event whenever a threshold is crossed (edge-triggered).
+  No events are emitted on cold start (no previous state to compare against).
+  No duplicate events are emitted while a condition persists.
+
+  Each event line is a single JSON object with at least:
+    ts        ISO 8601 UTC timestamp of the refresh that detected the crossing.
+    type      Always "threshold_crossed".
+    window    "five_hour", "seven_day", or "account".
+    trigger   One of the five trigger values below.
+
+  Five trigger values:
+    pace_critical      five_hour or seven_day level entered "Pump the brakes".
+    pace_warning       five_hour or seven_day level entered "Ease up".
+    pace_recovered     Level dropped out of "Pump the brakes" or "Ease up".
+    exhaustion_imminent  projected_exhaustion crossed under BISHOP_EXHAUSTION_IMMINENT_SECONDS.
+    overage_started    billing_mode flipped to "metered" (overage credits now incurred).
+
+  Rotation: when the events file reaches BISHOP_EVENTS_MAX_BYTES (default 1 MB),
+  it is renamed to <file>.1 and a new file is started. Active file is always
+  written via a tmp + mv — no torn writes.
+
+  Delivery to consumers (tailing, polling, inotify) is out of scope for Bishop.
+
 DATA SOURCES
   Primary: Anthropic OAuth /api/oauth/usage endpoint (per-model visibility).
     Header: anthropic-beta: oauth-2025-04-20
@@ -809,6 +968,14 @@ ENVIRONMENT VARIABLES
                             attribution (default: ~/.mother/metrics/runs.jsonl).
                             Bishop reads this file read-only; if missing or
                             unreadable, agents is {} and bishop never crashes.
+  BISHOP_EVENTS_PATH            Path to the JSON-lines events file
+                                (default: ~/.claude/budget-posture.events.jsonl).
+  BISHOP_EVENTS_MAX_BYTES       Events file size cap before rotation in bytes
+                                (default: 1048576 = 1 MB).
+  BISHOP_EXHAUSTION_IMMINENT_SECONDS  Seconds before projected exhaustion that
+                                triggers exhaustion_imminent event
+                                (default: 1800 = 30 minutes).
+  BISHOP_EVENT_TS_OVERRIDE      Pin event timestamps (testing only).
 EOF
   exit 0
 }

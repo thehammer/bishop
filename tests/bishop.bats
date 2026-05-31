@@ -44,6 +44,8 @@ EOF
   export BISHOP_USAGE_CACHE_TTL_SECONDS=55
   # Default: OAuth disabled so existing tests always use Mother-aggregate path
   export BISHOP_USAGE_FETCH_CMD="$FETCH_DISABLED"
+  export BISHOP_EVENTS_PATH="${TEST_DIR}/events.jsonl"
+  export BISHOP_EVENT_TS_OVERRIDE="2026-05-31T08:15:00Z"
   unset BISHOP_DISABLED
 }
 
@@ -1000,4 +1002,334 @@ _runs_line() {
 
   agents="$(jq -c '.agents' "$OUTPUT_PATH")"
   [ "$agents" = "{}" ]
+}
+
+# ===========================================================================
+# Push-threshold event tests (cases 1–12)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper: write prev posture JSON directly to OUTPUT_PATH
+# ---------------------------------------------------------------------------
+_write_prev_posture() {
+  printf '%s\n' "$1" > "$OUTPUT_PATH"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: seed pace-history with N samples at fh pace, so smoothed pace
+# triggers the given level. Uses FIXED_NOW.
+# Usage: _seed_pace_history <fh_pace> <sd_pace> <n_samples>
+# ---------------------------------------------------------------------------
+_seed_pace_history() {
+  local fh="$1" sd="$2" n="$3"
+  local hist_path="${OUTPUT_PATH}.pace-history.json"
+  local samples="["
+  local i
+  for i in $(seq 1 "$n"); do
+    [[ "$i" -gt 1 ]] && samples="${samples},"
+    samples="${samples}{\"ts\":$((FIXED_NOW - i * 100)),\"fh\":${fh},\"sd\":${sd}}"
+  done
+  samples="${samples}]"
+  printf '%s\n' "$samples" > "$hist_path"
+}
+
+# ---------------------------------------------------------------------------
+# 1. No events emitted on cold start
+# ---------------------------------------------------------------------------
+@test "events: no events emitted on cold start" {
+  # Fresh TEST_DIR, no OUTPUT_PATH exists
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  # Events file should be absent or empty
+  if [[ -f "$BISHOP_EVENTS_PATH" ]]; then
+    local count
+    count="$(wc -l < "$BISHOP_EVENTS_PATH" | tr -d ' ')"
+    [ "$count" -eq 0 ]
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 2. pace_critical emitted when level enters "Pump the brakes"
+# ---------------------------------------------------------------------------
+@test "events: pace_critical emitted when level enters Pump the brakes" {
+  # Previous posture: five_hour.level="Cruise"
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # fh: 80% utilized, fh_resets=FIXED_NOW+9000 → elapsed=50%, pace=1.6 → "Pump the brakes"
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 80.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local last_line
+  last_line="$(tail -1 "$BISHOP_EVENTS_PATH")"
+
+  trigger="$(printf '%s' "$last_line" | jq -r '.trigger')"
+  window="$(printf '%s' "$last_line" | jq -r '.window')"
+  ts="$(printf '%s' "$last_line" | jq -r '.ts')"
+
+  [ "$trigger" = "pace_critical" ]
+  [ "$window" = "five_hour" ]
+  [ "$ts" = "2026-05-31T08:15:00Z" ]
+  # pace field should be present and non-null (raw pace=1.6)
+  pace_key="$(printf '%s' "$last_line" | jq 'has("pace")')"
+  [ "$pace_key" = "true" ]
+}
+
+# ---------------------------------------------------------------------------
+# 3. pace_warning emitted when level enters "Ease up"
+# ---------------------------------------------------------------------------
+@test "events: pace_warning emitted when level enters Ease up" {
+  # Previous posture: five_hour.level="Cruise"
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # fh: 60% utilized, fh_resets=FIXED_NOW+9000 → elapsed=50%, pace=1.2 → "Ease up" (1.1 < 1.2 ≤ 1.4)
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 60.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local last_line
+  last_line="$(tail -1 "$BISHOP_EVENTS_PATH")"
+  trigger="$(printf '%s' "$last_line" | jq -r '.trigger')"
+  [ "$trigger" = "pace_warning" ]
+}
+
+# ---------------------------------------------------------------------------
+# 4. pace_recovered emitted when dropping from "Pump the brakes" to "Cruise"
+# ---------------------------------------------------------------------------
+@test "events: pace_recovered emitted when dropping from Pump the brakes" {
+  # Previous posture: five_hour.level="Pump the brakes"
+  _write_prev_posture '{"five_hour":{"level":"Pump the brakes"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # Standard fixture: elapsed=0% → pace=null → level="Cruise" (no over-pace history)
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local last_line
+  last_line="$(tail -1 "$BISHOP_EVENTS_PATH")"
+  trigger="$(printf '%s' "$last_line" | jq -r '.trigger')"
+  window="$(printf '%s' "$last_line" | jq -r '.window')"
+  [ "$trigger" = "pace_recovered" ]
+  [ "$window" = "five_hour" ]
+}
+
+# ---------------------------------------------------------------------------
+# 5. No pace event when level unchanged
+# ---------------------------------------------------------------------------
+@test "events: no pace event when level unchanged" {
+  # Previous posture: both windows at "Cruise"
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # Standard fixture: also produces "Cruise" (elapsed=0%, pace=null)
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # No pace event lines should be present
+  if [[ -f "$BISHOP_EVENTS_PATH" ]]; then
+    local count
+    count="$(grep -c '"trigger":"pace_' "$BISHOP_EVENTS_PATH" 2>/dev/null || echo 0)"
+    [ "$count" -eq 0 ]
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 6. overage_started emitted when billing_mode flips to metered
+# ---------------------------------------------------------------------------
+@test "events: overage_started emitted when billing_mode flips to metered" {
+  # Previous posture: billing_mode=subscription
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # New fixture: extra_usage.is_enabled=true + used_credits=500 → billing_mode="metered"
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 true 500)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local found
+  found="$(grep -c '"trigger":"overage_started"' "$BISHOP_EVENTS_PATH" 2>/dev/null || echo 0)"
+  [ "$found" -ge 1 ]
+
+  # Check window and ts on the matching line
+  local line
+  line="$(grep '"trigger":"overage_started"' "$BISHOP_EVENTS_PATH" | tail -1)"
+  window="$(printf '%s' "$line" | jq -r '.window')"
+  ts="$(printf '%s' "$line" | jq -r '.ts')"
+  [ "$window" = "account" ]
+  [ "$ts" = "2026-05-31T08:15:00Z" ]
+}
+
+# ---------------------------------------------------------------------------
+# 7. No overage_started when already metered
+# ---------------------------------------------------------------------------
+@test "events: no overage_started when already metered" {
+  # Previous posture: already metered
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"metered"}'
+
+  # New fixture also metered
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 true 500)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  if [[ -f "$BISHOP_EVENTS_PATH" ]]; then
+    local found
+    found="$(grep -c '"trigger":"overage_started"' "$BISHOP_EVENTS_PATH" 2>/dev/null || echo 0)"
+    [ "$found" -eq 0 ]
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 8. exhaustion_imminent emitted when projected_exhaustion crosses under 30 min
+# ---------------------------------------------------------------------------
+@test "events: exhaustion_imminent emitted when projected_exhaustion is imminent" {
+  # Previous posture: no projected_exhaustion
+  _write_prev_posture '{"five_hour":{"level":"Pump the brakes","projected_exhaustion":null},"seven_day":{"level":"Cruise","projected_exhaustion":null},"billing_mode":"subscription"}'
+
+  # Build fixture where fh projects exhaustion within 1800s of FIXED_NOW
+  # fh: used=80, elapsed=50% → ee = now + elapsed_secs*(20/80) < resets
+  # elapsed_secs = 9000, ee = FIXED_NOW + 9000*(20/80) = FIXED_NOW + 2250 (< 1800? No, 2250 > 1800)
+  # Need ee within 1800s. Try used=95, elapsed=50%: ee = FIXED_NOW + 9000*(5/95) ≈ FIXED_NOW+473
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 95.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local found
+  found="$(grep -c '"trigger":"exhaustion_imminent"' "$BISHOP_EVENTS_PATH" 2>/dev/null || echo 0)"
+  [ "$found" -ge 1 ]
+
+  local line
+  line="$(grep '"trigger":"exhaustion_imminent"' "$BISHOP_EVENTS_PATH" | tail -1)"
+  window="$(printf '%s' "$line" | jq -r '.window')"
+  mins="$(printf '%s' "$line" | jq -r '.minutes_remaining')"
+  [ "$window" = "five_hour" ]
+  [ "$mins" -lt 30 ]
+}
+
+# ---------------------------------------------------------------------------
+# 9. exhaustion_imminent not re-emitted while already imminent
+# ---------------------------------------------------------------------------
+@test "events: exhaustion_imminent not re-emitted while already imminent" {
+  # Previous posture: projected_exhaustion already within 1800s of FIXED_NOW
+  # ee = FIXED_NOW + 473 (used=95, elapsed=50%, fh_resets = FIXED_NOW+9000)
+  local fh_resets=$((FIXED_NOW + 9000))
+  local ee_epoch=$((FIXED_NOW + 473))
+  local ee_iso
+  ee_iso="$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${ee_epoch}, tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+
+  _write_prev_posture "{\"five_hour\":{\"level\":\"Pump the brakes\",\"projected_exhaustion\":\"${ee_iso}\"},\"seven_day\":{\"level\":\"Cruise\",\"projected_exhaustion\":null},\"billing_mode\":\"subscription\"}"
+
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 95.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # No new exhaustion_imminent should be appended
+  if [[ -f "$BISHOP_EVENTS_PATH" ]]; then
+    local found
+    found="$(grep -c '"trigger":"exhaustion_imminent"' "$BISHOP_EVENTS_PATH" 2>/dev/null || echo 0)"
+    [ "$found" -eq 0 ]
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 10. Events file rotates at cap
+# ---------------------------------------------------------------------------
+@test "events: events file rotates at cap" {
+  export BISHOP_EVENTS_MAX_BYTES=200
+
+  # Pre-create events file > 200 bytes
+  python3 -c "print('{\"ts\":\"2026-05-31T00:00:00Z\",\"type\":\"threshold_crossed\",\"window\":\"five_hour\",\"trigger\":\"pace_critical\"}' * 3)" > "$BISHOP_EVENTS_PATH"
+
+  # Trigger a crossing: previous="Cruise", new="Pump the brakes" via raw pace > 1.4
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+  local fh_resets=$((FIXED_NOW + 9000))
+  local sd_resets=$((FIXED_NOW + 302400))
+  _write_mock "$(_oauth_fixture_timed 80.0 "$fh_resets" 50.0 "$sd_resets" false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # Rotation file should exist
+  [ -f "${BISHOP_EVENTS_PATH}.1" ]
+
+  # Active file should have the new event line
+  [ -f "$BISHOP_EVENTS_PATH" ]
+  local count
+  count="$(wc -l < "$BISHOP_EVENTS_PATH" | tr -d ' ')"
+  [ "$count" -ge 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# 11. Every emitted line is valid JSON
+# ---------------------------------------------------------------------------
+@test "events: every emitted line is valid JSON" {
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+
+  # Trigger multiple crossings in sequence
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+  _seed_pace_history 1.5 0.5 3
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  if [[ -f "$BISHOP_EVENTS_PATH" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      run jq -e . <<< "$line"
+      [ "$status" -eq 0 ]
+    done < "$BISHOP_EVENTS_PATH"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 12. Event emission never affects exit code
+# ---------------------------------------------------------------------------
+@test "events: event emission never affects exit code on unwritable path" {
+  # Previous posture: "Cruise"
+  _write_prev_posture '{"five_hour":{"level":"Cruise"},"seven_day":{"level":"Cruise"},"billing_mode":"subscription"}'
+
+  # Point BISHOP_EVENTS_PATH to an unwritable location
+  local unwritable_dir="${TEST_DIR}/no_access"
+  mkdir -p "$unwritable_dir"
+  chmod 000 "$unwritable_dir"
+  export BISHOP_EVENTS_PATH="${unwritable_dir}/events.jsonl"
+
+  # Trigger a crossing
+  export BISHOP_PACE_SMOOTH_WINDOW_SECONDS=2700
+  export BISHOP_PACE_SMOOTH_MIN_SAMPLES=3
+  _seed_pace_history 1.5 0.5 3
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+
+  # Posture file must still be written correctly
+  [ -f "$OUTPUT_PATH" ]
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  # Restore permissions for cleanup
+  chmod 755 "$unwritable_dir"
 }
