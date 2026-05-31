@@ -16,6 +16,7 @@ set -euo pipefail
 : "${BISHOP_USAGE_CACHE_TTL_SECONDS:=55}"
 : "${BISHOP_PACE_SMOOTH_WINDOW_SECONDS:=2700}"
 : "${BISHOP_PACE_SMOOTH_MIN_SAMPLES:=3}"
+: "${BISHOP_MOTHER_RUNS_PATH:=$HOME/.mother/metrics/runs.jsonl}"
 
 LOCK_PATH="${BISHOP_OUTPUT_PATH}.lock"
 ERR_LOG="${HOME}/.claude/budget-posture.errors.log"
@@ -60,6 +61,51 @@ _bishop_source_mtime() {
 _bishop_file_mtime() {
   local file="$1"
   stat -f %m "$file" 2>/dev/null || echo 0
+}
+
+_bishop_agents_json() {
+  local now="$1"
+  local runs_path="${BISHOP_MOTHER_RUNS_PATH}"
+  if [[ ! -r "$runs_path" ]]; then
+    echo '{}'
+    return 0
+  fi
+  local fh_start sd_start
+  fh_start=$(( now - 18000 ))
+  sd_start=$(( now - 604800 ))
+  jq -R -n -c \
+    --argjson now "$now" \
+    --argjson fh_start "$fh_start" \
+    --argjson sd_start "$sd_start" \
+    '
+    def parse_iso:
+      sub("\\.[0-9]+(?=[+Z])"; "")
+      | sub("\\+00:00$"; "Z")
+      | fromdateiso8601;
+    reduce (inputs
+            | . as $line
+            | (try fromjson catch empty)
+            | select(type == "object")
+            | select(.outcome == "succeeded")
+            | select(.stage != null and (.stage|type) == "string")
+            | . as $r
+            | ($r.ts | try parse_iso catch empty) as $ets
+            | select($ets != null and ($ets >= $sd_start) and ($ets <= $now))
+            | { stage: $r.stage,
+                ts: $ets,
+                tin:  (($r.tokens_in  // 0) | if type == "number" then . else 0 end),
+                tout: (($r.tokens_out // 0) | if type == "number" then . else 0 end) }
+           ) as $rec ({};
+      ($rec.ts >= $fh_start and $rec.ts <= $now) as $in5h
+      | .[$rec.stage] = ((.[$rec.stage]) //
+          {tokens_in_5h:0, tokens_out_5h:0, tokens_in_7d:0, tokens_out_7d:0})
+      | .[$rec.stage].tokens_in_7d  += $rec.tin
+      | .[$rec.stage].tokens_out_7d += $rec.tout
+      | (if $in5h then
+           .[$rec.stage].tokens_in_5h  += $rec.tin
+           | .[$rec.stage].tokens_out_5h += $rec.tout
+         else . end))
+    ' "$runs_path" 2>/dev/null || echo '{}'
 }
 
 # ---------------------------------------------------------------------------
@@ -198,6 +244,7 @@ def model_entry(key):
     seven_day: ($sd + {pace_smoothed: $sd_smoothed}),
     models: { sonnet: $sonnet, opus: $opus, haiku: $haiku },
     exhausted_models: $exhausted_models,
+    agents: $agents,
     billing_mode: (if ($eu.is_enabled // false) and (($eu.used_credits // 0) > 0)
                    then "metered" else "subscription" end),
     overage: {
@@ -291,6 +338,7 @@ def compute_window(key; now):
     seven_day: ($sd + {pace_smoothed: null}),
     models: { sonnet: null, opus: null, haiku: null },
     exhausted_models: [],
+    agents: {},
     billing_mode: "subscription",
     overage: {
       enabled: false,
@@ -410,6 +458,10 @@ _bishop_refresh() {
       stale_input="false"
     fi
 
+    local agents_json
+    agents_json="$(_bishop_agents_json "$now")"
+    [[ -z "$agents_json" ]] && agents_json='{}'
+
     if printf '%s' "$oauth_data" | jq \
         --argjson now "$now" \
         --argjson source_mtime "$cache_mtime" \
@@ -417,6 +469,7 @@ _bishop_refresh() {
         --argjson pace_history "$pace_history" \
         --argjson smooth_window "$BISHOP_PACE_SMOOTH_WINDOW_SECONDS" \
         --argjson smooth_min "$BISHOP_PACE_SMOOTH_MIN_SAMPLES" \
+        --argjson agents "$agents_json" \
         "$_BISHOP_OAUTH_JQ_PROGRAM" > "$tmp_output" 2>/dev/null; then
       mv "$tmp_output" "$BISHOP_OUTPUT_PATH"
 
@@ -712,6 +765,13 @@ OUTPUT FIELDS (budget-posture.json)
   extra_usage           Raw extra-usage block from OAuth response (backward compat).
   models                Per-model quota objects (OAuth path only).
   exhausted_models      Array of model names at 100% utilization.
+  agents                Per-Mother-agent token attribution (OAuth path only),
+                        keyed by stage (cody, perri, redd, marty). Each entry:
+                        tokens_in_5h, tokens_out_5h, tokens_in_7d, tokens_out_7d
+                        summed over succeeded jobs within the window. Only agents
+                        with at least one succeeded in-window job appear.
+                        Interactive (non-Mother) sessions are not attributable.
+                        Always {} on the Mother-aggregate fallback path.
 
 DATA SOURCES
   Primary: Anthropic OAuth /api/oauth/usage endpoint (per-model visibility).
@@ -745,6 +805,10 @@ ENVIRONMENT VARIABLES
                                 seconds (default: 2700 = 45 minutes).
   BISHOP_PACE_SMOOTH_MIN_SAMPLES  Minimum samples before emitting pace_smoothed
                                 (default: 3). Fewer samples → null.
+  BISHOP_MOTHER_RUNS_PATH   Mother per-job metrics log for per-agent token
+                            attribution (default: ~/.mother/metrics/runs.jsonl).
+                            Bishop reads this file read-only; if missing or
+                            unreadable, agents is {} and bishop never crashes.
 EOF
   exit 0
 }

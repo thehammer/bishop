@@ -823,3 +823,181 @@ JSON
   [ "$is_enabled" = "true" ]
   [ "$used_credits" = "15650" ]
 }
+
+# ===========================================================================
+# Per-agent spend attribution tests (cases w1–w7)
+# ===========================================================================
+
+# Helper: produce an ISO timestamp at FIXED_NOW + offset
+_iso_at() {
+  python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${FIXED_NOW} + ($1), tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000+00:00'))"
+}
+
+# Helper: append a runs.jsonl line
+_runs_line() {
+  printf '{"ts":"%s","stage":"%s","outcome":"%s","tokens_in":%s,"tokens_out":%s}\n' \
+    "$3" "$1" "$2" "$4" "$5" >> "${BISHOP_MOTHER_RUNS_PATH}"
+}
+
+# ---------------------------------------------------------------------------
+# (w1) Aggregation across windows
+# ---------------------------------------------------------------------------
+@test "agents: aggregation across 5h and 7d windows" {
+  export BISHOP_MOTHER_RUNS_PATH="${TEST_DIR}/runs.jsonl"
+  : > "${BISHOP_MOTHER_RUNS_PATH}"
+
+  # Two cody jobs inside 5h
+  _runs_line "cody" "succeeded" "$(_iso_at -100)"  "1000000" "500000"
+  _runs_line "cody" "succeeded" "$(_iso_at -200)"  "800000"  "400000"
+  # One cody job inside 7d but outside 5h (offset -300000, which is > 18000s ago)
+  _runs_line "cody" "succeeded" "$(_iso_at -300000)" "500000" "250000"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  tin_5h="$(jq -r '.agents.cody.tokens_in_5h' "$OUTPUT_PATH")"
+  tin_7d="$(jq -r '.agents.cody.tokens_in_7d' "$OUTPUT_PATH")"
+
+  [ "$tin_5h" = "1800000" ]
+  [ "$tin_7d" = "2300000" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w2) Failed outcome jobs are excluded
+# ---------------------------------------------------------------------------
+@test "agents: failed outcome jobs are excluded" {
+  export BISHOP_MOTHER_RUNS_PATH="${TEST_DIR}/runs.jsonl"
+  : > "${BISHOP_MOTHER_RUNS_PATH}"
+
+  # One perri job with outcome:failed inside 5h
+  _runs_line "perri" "failed" "$(_iso_at -100)" "999999" "888888"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  perri="$(jq -r '.agents.perri' "$OUTPUT_PATH")"
+  [ "$perri" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w3) Null tokens treated as zero
+# ---------------------------------------------------------------------------
+@test "agents: null tokens treated as zero" {
+  export BISHOP_MOTHER_RUNS_PATH="${TEST_DIR}/runs.jsonl"
+  : > "${BISHOP_MOTHER_RUNS_PATH}"
+
+  # One marty job with null tokens inside 5h
+  printf '{"ts":"%s","stage":"marty","outcome":"succeeded","tokens_in":null,"tokens_out":null}\n' \
+    "$(_iso_at -100)" >> "${BISHOP_MOTHER_RUNS_PATH}"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  tin_5h="$(jq -r '.agents.marty.tokens_in_5h' "$OUTPUT_PATH")"
+  [ "$tin_5h" = "0" ]
+
+  # Entry must be present (not null)
+  marty="$(jq -r '.agents.marty' "$OUTPUT_PATH")"
+  [ "$marty" != "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w4) Out-of-7d-window agent absent
+# ---------------------------------------------------------------------------
+@test "agents: out-of-7d-window job produces no entry" {
+  export BISHOP_MOTHER_RUNS_PATH="${TEST_DIR}/runs.jsonl"
+  : > "${BISHOP_MOTHER_RUNS_PATH}"
+
+  # One redd job at offset -700000 (older than 7d = 604800s)
+  _runs_line "redd" "succeeded" "$(_iso_at -700000)" "100000" "50000"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  redd="$(jq -r '.agents.redd' "$OUTPUT_PATH")"
+  [ "$redd" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w5) Missing runs file → agents is empty map, exits 0
+# ---------------------------------------------------------------------------
+@test "agents: missing runs file yields empty map and exit 0" {
+  export BISHOP_MOTHER_RUNS_PATH="/nonexistent/path/runs.jsonl"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  agents="$(jq -c '.agents' "$OUTPUT_PATH")"
+  [ "$agents" = "{}" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w6) Malformed lines tolerated
+# ---------------------------------------------------------------------------
+@test "agents: malformed lines in runs file are tolerated" {
+  export BISHOP_MOTHER_RUNS_PATH="${TEST_DIR}/runs.jsonl"
+  : > "${BISHOP_MOTHER_RUNS_PATH}"
+
+  # One garbage line
+  printf 'THIS IS NOT JSON\n' >> "${BISHOP_MOTHER_RUNS_PATH}"
+  # One valid cody succeeded in-5h record
+  _runs_line "cody" "succeeded" "$(_iso_at -100)" "123456" "654321"
+
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  run jq -e . "$OUTPUT_PATH"
+  [ "$status" -eq 0 ]
+
+  tin_5h="$(jq -r '.agents.cody.tokens_in_5h' "$OUTPUT_PATH")"
+  [ "$tin_5h" = "123456" ]
+}
+
+# ---------------------------------------------------------------------------
+# (w7) Mother-fallback static empty agents map
+# ---------------------------------------------------------------------------
+@test "agents: Mother-aggregate fallback has static empty agents map" {
+  # Default setup: no fetch cmd, no cache → Mother aggregate path
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ -f "$OUTPUT_PATH" ]
+
+  source="$(jq -r '.source' "$OUTPUT_PATH")"
+  [ "$source" = "mother_aggregate" ]
+
+  agents="$(jq -c '.agents' "$OUTPUT_PATH")"
+  [ "$agents" = "{}" ]
+}
