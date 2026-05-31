@@ -5,10 +5,15 @@
 ```
 bin/bishop                              Main CLI (single executable, no lib split)
 launchd/com.user.bishop.refresh.plist   Template — placeholders substituted at install-agent time
-tests/bishop.bats                       bats-core unit tests (10 cases)
+tests/bishop.bats                       bats-core unit tests (22 cases)
 scripts/install.sh                      Symlink bin/bishop to $PREFIX (~/.local/bin)
 scripts/doctor.sh                       Dependency health check
 docs/PLAN.md                            Implementation plan (canonical reference)
+
+Runtime files (written by bishop --refresh):
+~/.claude/budget-posture.json           Current posture snapshot (polled by consumers)
+~/.claude/budget-posture.events.jsonl   Push-threshold events (JSON-lines, edge-triggered)
+                                        Rotates to .events.jsonl.1 at 1 MB (BISHOP_EVENTS_MAX_BYTES)
 ```
 
 ## Shell conventions
