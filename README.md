@@ -112,6 +112,7 @@ When falling back to the Mother aggregate, `source` is `"mother_aggregate"`,
 | `models.sonnet` | Plan-specific 7-day Sonnet bucket. `null` if plan has no separate Sonnet cap. |
 | `models.opus`   | Plan-specific 7-day Opus bucket. `null` if plan has no separate Opus cap. |
 | `models.haiku`  | Plan-specific 7-day Haiku bucket. `null` if plan has no separate Haiku cap. |
+| `scoped` | Per-model weekly quotas from the usage `limits[]` array (`kind: weekly_scoped`), e.g. Fable: `[{model, used_pct, elapsed_pct, pace, resets_at, severity, is_active}]`. `[]` when none/Mother fallback. |
 | `exhausted_models` | Array of model names where `status == "exhausted"`. |
 | `extra_usage` | Overage / pay-per-use block. `null` when source is Mother aggregate. |
 
