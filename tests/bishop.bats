@@ -1333,3 +1333,47 @@ _seed_pace_history() {
   # Restore permissions for cleanup
   chmod 755 "$unwritable_dir"
 }
+
+# ---------------------------------------------------------------------------
+# Real-world payload: five_hour.resets_at null (window not started) + limits[]
+# ---------------------------------------------------------------------------
+_limits_fixture() {
+  cat <<JSON
+{
+  "five_hour": { "utilization": 0.0, "resets_at": null },
+  "seven_day": { "utilization": 40.0, "resets_at": "${OAUTH_RESETS_FUTURE}" },
+  "seven_day_sonnet": null,
+  "limits": [
+    {"kind":"session","group":"session","percent":0,"severity":"normal","resets_at":null,"scope":null,"is_active":false},
+    {"kind":"weekly_all","group":"weekly","percent":40,"severity":"normal","resets_at":"${OAUTH_RESETS_FUTURE}","scope":null,"is_active":true},
+    {"kind":"weekly_scoped","group":"weekly","percent":25,"severity":"normal","resets_at":"${OAUTH_RESETS_FUTURE}","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}
+  ]
+}
+JSON
+}
+
+@test "OAuth: null five_hour.resets_at stays on oauth_usage path" {
+  _write_mock "$(_limits_fixture)"
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.source' "$OUTPUT_PATH")" = "oauth_usage" ]
+  [ "$(jq -r '.five_hour.used_pct == 0' "$OUTPUT_PATH")" = "true" ]
+  [ "$(jq -r '.five_hour.resets_at' "$OUTPUT_PATH")" = "null" ]
+  [ "$(jq -r '.five_hour.level' "$OUTPUT_PATH")" = "Cruise" ]
+}
+
+@test "OAuth: weekly_scoped limits surface as scoped[] (Fable)" {
+  _write_mock "$(_limits_fixture)"
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.scoped | length' "$OUTPUT_PATH")" = "1" ]
+  [ "$(jq -r '.scoped[0].model' "$OUTPUT_PATH")" = "Fable" ]
+  [ "$(jq -r '.scoped[0].used_pct' "$OUTPUT_PATH")" = "25" ]
+}
+
+@test "OAuth: payload without limits yields empty scoped[]" {
+  _write_mock "$(_oauth_fixture 50.0 null null 12.0 71.0 false 0)"
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '.scoped' "$OUTPUT_PATH")" = "[]" ]
+}

@@ -245,9 +245,10 @@ _BISHOP_OAUTH_JQ_PROGRAM='
 # Strip fractional seconds and normalize +00:00 → Z before ISO parse
 # (macOS jq fromdateiso8601 only accepts Z-suffix UTC, not +00:00)
 def parse_iso:
+  if . == null then null else
   sub("\\.[0-9]+(?=[+Z])"; "")
   | sub("\\+00:00$"; "Z")
-  | fromdateiso8601;
+  | fromdateiso8601 end;
 
 def window_seconds(key): if key == "five_hour" then 18000 else 604800 end;
 
@@ -286,8 +287,9 @@ def compute_window(key; src; now):
   src[key] as $w
   | window_seconds(key) as $ws
   | ($w.used_percentage // 0) as $used
-  | ($w.resets_at // 0) as $resets
-  | (($ws - ($resets - now)) / $ws * 100) as $raw_elapsed
+  | ($w.resets_at // null) as $resets_raw
+  | ($resets_raw // 0) as $resets
+  | (if $resets_raw == null then 0 else (($ws - ($resets - now)) / $ws * 100) end) as $raw_elapsed
   | (if $raw_elapsed < 0 then 0 elif $raw_elapsed > 100 then 100 else $raw_elapsed end) as $elapsed
   | (if $elapsed < 2 then null
      else ($used / (if $elapsed < 1 then 1 else $elapsed end))
@@ -303,8 +305,26 @@ def compute_window(key; src; now):
       elapsed_pct: ($elapsed | . * 10 | round / 10),
       pace: (if $pace == null then null else ($pace * 100 | round / 100) end),
       projected_exhaustion: $projected_exhaustion,
-      resets_at: $resets,
+      resets_at: $resets_raw,
       level: (if $pace == null then "Cruise" else level_for(key; $pace) end)
+    };
+
+# Per-model scoped weekly quotas (limits[] kind=weekly_scoped), e.g. Fable.
+def scoped_entry(now):
+  (.scope.model.display_name // null) as $name
+  | (.resets_at | parse_iso) as $resets
+  | (.percent // 0) as $used
+  | (if $resets == null then 0
+     else ((604800 - ($resets - now)) / 604800 * 100) end) as $raw
+  | (if $raw < 0 then 0 elif $raw > 100 then 100 else $raw end) as $elapsed
+  | {
+      model: $name,
+      used_pct: $used,
+      elapsed_pct: ($elapsed | . * 10 | round / 10),
+      pace: (if $elapsed < 2 then null else ($used / $elapsed * 100 | round / 100) end),
+      resets_at: $resets,
+      severity: (.severity // "normal"),
+      is_active: (.is_active // false)
     };
 
 def model_entry(key):
@@ -312,7 +332,7 @@ def model_entry(key):
   | if $bucket == null then null
     else
       ($bucket.resets_at | parse_iso) as $resets
-      | if $resets <= $now then null
+      | if $resets == null or $resets <= $now then null
         else
           {
             status: (if ($bucket.utilization // 0) >= 100 then "exhausted" else "active" end),
@@ -369,6 +389,7 @@ def model_entry(key):
     five_hour: ($fh + {pace_smoothed: $fh_smoothed}),
     seven_day: ($sd + {pace_smoothed: $sd_smoothed}),
     models: { sonnet: $sonnet, opus: $opus, haiku: $haiku },
+    scoped: [ ($oauth.limits // [])[] | select(.kind == "weekly_scoped" and .scope.model.display_name != null) | scoped_entry($now) ],
     exhausted_models: $exhausted_models,
     agents: $agents,
     billing_mode: (if ($eu.is_enabled // false) and (($eu.used_credits // 0) > 0)
@@ -463,6 +484,7 @@ def compute_window(key; now):
     five_hour: ($fh + {pace_smoothed: null}),
     seven_day: ($sd + {pace_smoothed: null}),
     models: { sonnet: null, opus: null, haiku: null },
+    scoped: [],
     exhausted_models: [],
     agents: {},
     billing_mode: "subscription",
@@ -898,6 +920,7 @@ OUTPUT FIELDS (budget-posture.json)
     limits                Token limits per window, or null.
   extra_usage           Raw extra-usage block from OAuth response (backward compat).
   models                Per-model quota objects (OAuth path only).
+  scoped                Per-model weekly quotas (e.g. Fable) from limits[]; [] if none.
   exhausted_models      Array of model names at 100% utilization.
   agents                Per-Mother-agent token attribution (OAuth path only),
                         keyed by stage (cody, perri, redd, marty). Each entry:
