@@ -67,6 +67,54 @@ _bishop_file_mtime() {
   stat -f %m "$file" 2>/dev/null || echo 0
 }
 
+# True when the existing output file is valid and already reports stale_input.
+_bishop_output_is_stale() {
+  [[ -f "$BISHOP_OUTPUT_PATH" ]] || return 1
+  [[ "$(jq -r '.stale_input' "$BISHOP_OUTPUT_PATH" 2>/dev/null)" == "true" ]]
+}
+
+# True when the existing output was produced from the source version with this
+# mtime (guards the skip against an output written by a different source path).
+_bishop_output_matches_source() {
+  local mtime="$1"
+  [[ -f "$BISHOP_OUTPUT_PATH" ]] || return 1
+  [[ "$(jq -r '.source_mtime' "$BISHOP_OUTPUT_PATH" 2>/dev/null)" == "$(jq -n -r --argjson m "$mtime" '$m | todateiso8601')" ]]
+}
+
+# Flip the existing output to stale in place: stale_input=true, posture forced
+# to "Cruise" (the safe default), ts and source_age_seconds set to now. Every
+# other field is kept as last observed. Callers check _bishop_output_is_stale
+# first, so a source that has stopped updating is flipped once, not rewritten
+# every minute. Deliberately emits no events: no new reading was observed and
+# no window level changed.
+_bishop_mark_output_stale() {
+  local now="$1"
+  local tmp="${BISHOP_OUTPUT_PATH}.tmp.$$"
+  if jq --argjson now "$now" '
+      .ts = ($now | todateiso8601)
+      | .stale_input = true
+      | .posture = "Cruise"
+      | if (.source_mtime | type) == "string"
+        then .source_age_seconds = ([0, ($now - (.source_mtime | fromdateiso8601))] | max)
+        else . end' "$BISHOP_OUTPUT_PATH" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$BISHOP_OUTPUT_PATH"
+    _bishop_log_err "source stopped updating; output marked stale_input=true, posture forced to Cruise"
+  else
+    rm -f "$tmp"
+    _bishop_log_err "could not mark $BISHOP_OUTPUT_PATH stale (unreadable output)"
+  fi
+}
+
+# Print the output file with source_age_seconds recomputed from the stored
+# source_mtime and the current time (clamped at 0 for clock skew / future
+# mtimes), so readers never see the age frozen at the last write.
+_bishop_read_output() {
+  jq --argjson now "$(_bishop_now)" '
+    if (.source_mtime | type) == "string"
+    then .source_age_seconds = ([0, ($now - (.source_mtime | fromdateiso8601))] | max)
+    else . end' "$BISHOP_OUTPUT_PATH" 2>/dev/null || cat "$BISHOP_OUTPUT_PATH"
+}
+
 _bishop_agents_json() {
   local now="$1"
   local runs_path="${BISHOP_MOTHER_RUNS_PATH}"
@@ -657,6 +705,10 @@ _bishop_refresh() {
   # -------------------------------------------------------------------------
   if [[ ! -f "$BISHOP_SOURCE_PATH" ]]; then
     _bishop_log_err "source not found: $BISHOP_SOURCE_PATH"
+    # A vanished source must not leave the last reading looking fresh.
+    if [[ -f "$BISHOP_OUTPUT_PATH" ]] && ! _bishop_output_is_stale; then
+      _bishop_mark_output_stale "$now"
+    fi
     exit 0
   fi
 
@@ -666,7 +718,12 @@ _bishop_refresh() {
   if [[ -f "$STATE_PATH" ]]; then
     local saved_mtime
     saved_mtime="$(cat "$STATE_PATH" 2>/dev/null || echo 0)"
-    if [[ "$mtime" == "$saved_mtime" ]]; then
+    if [[ "$mtime" == "$saved_mtime" ]] && _bishop_output_matches_source "$mtime"; then
+      # Unchanged source: nothing to recompute, but if it has crossed the stale
+      # threshold since the last write, flip the output once (never every run).
+      if (( now - mtime > BISHOP_SOURCE_STALE_SECONDS )) && ! _bishop_output_is_stale; then
+        _bishop_mark_output_stale "$now"
+      fi
       exit 0
     fi
   fi
@@ -708,7 +765,7 @@ _bishop_status() {
       echo "{}"
       exit 0
     fi
-    cat "$BISHOP_OUTPUT_PATH"
+    _bishop_read_output
     exit 0
   fi
 
@@ -722,7 +779,7 @@ _bishop_status() {
   posture="$(jq -r '.posture // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
   fh_level="$(jq -r '.five_hour.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
   sd_level="$(jq -r '.seven_day.level // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
-  age="$(jq -r '.source_age_seconds // 0 | floor' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "0")"
+  age="$(_bishop_read_output | jq -r '.source_age_seconds // 0 | floor' 2>/dev/null || echo "0")"
   source="$(jq -r '.source // "unknown"' "$BISHOP_OUTPUT_PATH" 2>/dev/null || echo "unknown")"
 
   echo "${posture} (5h: ${fh_level} · 7d: ${sd_level} · age ${age}s)"
@@ -808,7 +865,7 @@ _bishop_get() {
     exit 0
   fi
 
-  jq -r ".${field} // empty" "$BISHOP_OUTPUT_PATH" 2>/dev/null || true
+  _bishop_read_output | jq -r ".${field} // empty" 2>/dev/null || true
   exit 0
 }
 
