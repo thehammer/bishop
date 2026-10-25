@@ -1377,3 +1377,166 @@ JSON
   [ "$status" -eq 0 ]
   [ "$(jq -c '.scoped' "$OUTPUT_PATH")" = "[]" ]
 }
+
+# ---------------------------------------------------------------------------
+# Staleness must not be hidden by the idempotent skip (Mother-aggregate path)
+# ---------------------------------------------------------------------------
+
+# Rewrites always go tmp-file + mv, so a new inode means the output was rewritten.
+_output_inode() { stat -f %i "$OUTPUT_PATH"; }
+
+_write_hot_source() {
+  cat > "$BISHOP_SOURCE_PATH" <<EOF2
+{"five_hour":{"used_percentage":100,"resets_at":${FIVE_HOUR_RESETS_HALF}},"seven_day":{"used_percentage":100,"resets_at":${SEVEN_DAY_RESETS_HALF}}}
+EOF2
+}
+
+@test "stale flip: untouched source going stale rewrites output with stale_input=true, posture=Cruise" {
+  _write_hot_source
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "false" ]
+  [ "$(jq -r '.posture' "$OUTPUT_PATH")" = "Pump the brakes" ]
+
+  # Same source mtime, clock moves past the threshold
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 700))
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "true" ]
+  [ "$(jq -r '.posture' "$OUTPUT_PATH")" = "Cruise" ]
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 730 ]
+  # Other fields keep their last observed values
+  [ "$(jq -r '.five_hour.level' "$OUTPUT_PATH")" = "Pump the brakes" ]
+  [ "$(jq -r '.source' "$OUTPUT_PATH")" = "mother_aggregate" ]
+}
+
+@test "stale flip: already-stale unchanged source is not rewritten on later refreshes" {
+  export BISHOP_MTIME_OVERRIDE=$((FIXED_NOW - 601))
+  run "$BISHOP_BIN" --refresh
+  inode1="$(_output_inode)"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 3600))
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$inode1" = "$(_output_inode)" ]
+
+  # Flip once, then no further rewrites
+  export BISHOP_MTIME_OVERRIDE=$((FIXED_NOW - 30))
+  export BISHOP_NOW_OVERRIDE=$FIXED_NOW
+  run "$BISHOP_BIN" --refresh
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 700))
+  run "$BISHOP_BIN" --refresh
+  inode2="$(_output_inode)"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 760))
+  run "$BISHOP_BIN" --refresh
+  [ "$inode2" = "$(_output_inode)" ]
+}
+
+@test "stale flip: fresh unchanged source still skips while within the threshold" {
+  run "$BISHOP_BIN" --refresh
+  inode1="$(_output_inode)"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 100))
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$inode1" = "$(_output_inode)" ]
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "false" ]
+}
+
+@test "stale flip: changed source mtime still recomputes" {
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 30 ]
+  export BISHOP_MTIME_OVERRIDE=$((FIXED_NOW - 5))
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 5 ]
+}
+
+@test "stale flip: emits no events (levels unchanged, no new reading)" {
+  _write_hot_source
+  run "$BISHOP_BIN" --refresh
+  # Cold start emits nothing; seed a known events file to compare against
+  printf '%s\n' '{"ts":"x","type":"threshold_crossed","window":"five_hour","trigger":"pace_critical"}' > "$BISHOP_EVENTS_PATH"
+  before="$(cat "$BISHOP_EVENTS_PATH")"
+
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 700))
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "true" ]
+  [ "$before" = "$(cat "$BISHOP_EVENTS_PATH")" ]
+}
+
+@test "read time: status, status --json and get report true age, not the frozen stored age" {
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 30 ]
+
+  # Four days later, no refresh at all
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 345600))
+  expected=$((345600 + 30))
+
+  run "$BISHOP_BIN" status
+  [[ "$output" == *"age ${expected}s)"* ]]
+
+  run "$BISHOP_BIN" status --json
+  [ "$(jq -r '.source_age_seconds' <<<"$output")" -eq "$expected" ]
+
+  run "$BISHOP_BIN" get source_age_seconds
+  [ "$output" -eq "$expected" ]
+
+  # The file on disk is untouched (still the age at write time)
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 30 ]
+}
+
+@test "read time: negative age (future mtime / clock skew) is clamped to 0" {
+  export BISHOP_MTIME_OVERRIDE=$((FIXED_NOW + 100))
+  run "$BISHOP_BIN" --refresh
+
+  run "$BISHOP_BIN" status
+  [[ "$output" == *"age 0s)"* ]]
+
+  run "$BISHOP_BIN" status --json
+  [ "$(jq -r '.source_age_seconds' <<<"$output")" -eq 0 ]
+
+  run "$BISHOP_BIN" get source_age_seconds
+  [ "$output" = "0" ]
+}
+
+@test "missing source: fresh output is flipped to stale_input=true, posture=Cruise" {
+  _write_hot_source
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.posture' "$OUTPUT_PATH")" = "Pump the brakes" ]
+
+  rm -f "$BISHOP_SOURCE_PATH"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 120))
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "true" ]
+  [ "$(jq -r '.posture' "$OUTPUT_PATH")" = "Cruise" ]
+  [ "$(jq -r '.source_age_seconds' "$OUTPUT_PATH")" -eq 150 ]
+}
+
+@test "missing source: already-stale output is not rewritten on later refreshes" {
+  run "$BISHOP_BIN" --refresh
+  rm -f "$BISHOP_SOURCE_PATH"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 120))
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "true" ]
+  inode1="$(_output_inode)"
+
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 3600))
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ "$inode1" = "$(_output_inode)" ]
+}
+
+@test "missing source: no output file is created when none exists" {
+  rm -f "$BISHOP_SOURCE_PATH"
+  run "$BISHOP_BIN" --refresh
+  [ "$status" -eq 0 ]
+  [ ! -f "$OUTPUT_PATH" ]
+}
+
+@test "missing source: no events emitted by the stale flip" {
+  _write_hot_source
+  run "$BISHOP_BIN" --refresh
+  rm -f "$BISHOP_SOURCE_PATH" "$BISHOP_EVENTS_PATH"
+  export BISHOP_NOW_OVERRIDE=$((FIXED_NOW + 120))
+  run "$BISHOP_BIN" --refresh
+  [ "$(jq -r '.stale_input' "$OUTPUT_PATH")" = "true" ]
+  [ ! -s "$BISHOP_EVENTS_PATH" ]
+}

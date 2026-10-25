@@ -136,6 +136,22 @@ level across both windows.
 `stale_input: true` (source older than `BISHOP_SOURCE_STALE_SECONDS`) forces
 `posture` to `"Cruise"` as a safe default.
 
+### Staleness and the on-disk file
+
+When the source stops updating (an unchanged mtime, or the source or usage
+cache disappearing), `--refresh` flips the existing file **once** to
+`stale_input: true`, `posture: "Cruise"`, with `ts` and `source_age_seconds`
+set to that moment. It does not rewrite the file again every minute while the
+source stays dead, and the flip emits no events (no new reading was observed;
+window levels are unchanged).
+
+Consequence for anything that parses `budget-posture.json` directly: once
+stale, `ts` and `source_age_seconds` stay frozen at the flip time. Do not treat
+them as "now". Use `stale_input` to decide whether to trust the reading and
+`source_mtime` for the true age (`now - source_mtime`). `bishop status`,
+`bishop status --json` and `bishop get` already do this: they recompute
+`source_age_seconds` from `source_mtime` at read time (clamped at 0).
+
 ## CLI reference
 
 ```
